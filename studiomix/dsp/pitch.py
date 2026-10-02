@@ -51,7 +51,9 @@ def _cmnd_candidates(x: np.ndarray, sr: int, fmin: float, fmax: float, hop: int,
     """YIN cumulative-mean-normalised difference, reduced to its local-minimum candidates.
 
     Returns per-frame arrays (nfr, max_cands) of candidate periods (samples, sub-sample precise)
-    and their CMND values, in increasing-period order, plus frame RMS (dB).
+    and their CMND values, in increasing-period order, frame RMS (dB), and `lead`: a candidate of
+    period tau is measured on audio centred (lead + tau / 2) samples from the frame's nominal time
+    (YIN compares the first I samples with the next I + tau, so it is not centred on the frame).
     """
     W = int(2 ** np.ceil(np.log2(sr * 0.04)))  # ~40 ms analysis window
     tau_max = min(W // 2 - 2, int(sr / fmin))
@@ -96,7 +98,8 @@ def _cmnd_candidates(x: np.ndarray, sr: int, fmin: float, fmax: float, hop: int,
         sh = np.clip(sh, -1, 1)
         cand_tau[s + rows, rank] = t + sh
         cand_val[s + rows, rank] = np.maximum(c0 - 0.25 * (l - rr) * sh, 0.0)
-    return cand_tau, cand_val, 20.0 * np.log10(rms + 1e-12)
+    lead = (I - W) / 2.0
+    return cand_tau, cand_val, 20.0 * np.log10(rms + 1e-12), lead
 
 
 BETA_B = 8.0
@@ -160,7 +163,7 @@ def yin(x: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 1100.0, hop: i
     # analyse below ~2.2 kHz: the fundamental and low harmonics carry the pitch, while breath,
     # rasp and sibilance (which make YIN call voiced frames unvoiced) mostly live above
     lp = signal.sosfiltfilt(signal.butter(4, 1200.0, fs=sr, output="sos"), x)
-    cand_tau, cand_val, rms_db = _cmnd_candidates(lp, sr, fmin, fmax, hop)
+    cand_tau, cand_val, rms_db, lead = _cmnd_candidates(lp, sr, fmin, fmax, hop)
     probs = _candidate_probs(cand_val)
     cand_midi = np.where(np.isfinite(cand_tau), hz_to_midi(sr / np.where(np.isfinite(cand_tau), cand_tau, 1.0)),
                          np.nan)
@@ -177,6 +180,19 @@ def yin(x: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 1100.0, hop: i
     f0 = np.where(voiced, sr / np.where(voiced, cand_tau[rows, pick], 1.0), np.nan)
     aper = np.where(voiced, cand_val[rows, pick], 1.0)
     times = np.arange(len(path)) * hop / sr
+    # re-time: each estimate describes audio centred (lead + tau/2) samples from its frame time
+    # (about -5 ms for a 200 Hz voice). Without this the tuner corrects slides and fast rap
+    # pitch movement with slightly stale pitch.
+    grid = np.arange(len(path)) * hop
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], voiced.astype(np.int8), [0]])))
+    m = np.full(len(path), np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m[voiced] = hz_to_midi(f0[voiced])
+    for a, b in zip(edges[::2], edges[1::2]):
+        if b - a < 2:
+            continue
+        true_t = grid[a:b] + lead + cand_tau[rows[a:b], pick[a:b]] / 2.0
+        f0[a:b] = midi_to_hz(np.interp(grid[a:b], true_t, m[a:b]))
     return times, f0, aper, rms_db, hop
 
 
@@ -288,6 +304,33 @@ def _note_path(m: np.ndarray, allowed: np.ndarray, sigma: float, switch_cost: fl
     return notes, path
 
 
+def _merge_short_notes(seq: np.ndarray, m: np.ndarray, min_frames: int) -> np.ndarray:
+    """Absorb notes shorter than `min_frames` into the neighbour closest in pitch.
+
+    A 20-50 ms note at a syllable onset (left over from the previous sound) would become an
+    audible pitch blip under hard tune; real melodic notes are longer than that.
+    """
+    seq = seq.copy()
+    while True:
+        change = np.flatnonzero(np.diff(seq)) + 1
+        starts = np.concatenate([[0], change])
+        ends = np.concatenate([change, [len(seq)]])
+        if len(starts) < 2:
+            return seq
+        lens = ends - starts
+        i = int(np.argmin(lens))
+        if lens[i] >= min_frames:
+            return seq
+        a, b = starts[i], ends[i]
+        centre = float(np.mean(m[a:b]))
+        cands = []
+        if i > 0:
+            cands.append(seq[a - 1])
+        if i + 1 < len(starts):
+            cands.append(seq[b])
+        seq[a:b] = min(cands, key=lambda c: abs(c - centre))
+
+
 def target_curve(trk: dict, sr: int, tonic: int, scale: str, retune_ms: float, humanize: float,
                  amount: float = 1.0, hysteresis: float = 0.2) -> np.ndarray:
     """Corrected pitch (MIDI) per frame; NaN where unvoiced."""
@@ -311,7 +354,7 @@ def target_curve(trk: dict, sr: int, tonic: int, scale: str, retune_ms: float, h
     since = np.zeros(n)
     for s0, s1 in zip(edges[::2], edges[1::2]):
         notes, path = _note_path(smooth[s0:s1], allowed, sigma=0.5, switch_cost=8.0 + 4.0 * hysteresis)
-        seg_target = notes[path]
+        seg_target = _merge_short_notes(notes[path], smooth[s0:s1], int(round(0.06 / hop_s)))
         target[s0:s1] = seg_target
         onset = 0
         for j in range(s1 - s0):

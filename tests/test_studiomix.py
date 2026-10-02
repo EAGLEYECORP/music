@@ -248,3 +248,21 @@ def test_tuner_benchmark_regression(case):
     assert r["track_gross_%"] < 2.0
     assert r["notes_ok_%"] >= 90.0
     assert r["note_err_c"] < 3.0
+
+
+def test_tracker_is_time_aligned_on_fast_slides():
+    """Pitch estimates must describe the audio at their own timestamps (no ~5 ms lag)."""
+    t = np.arange(int(SR * 1.5)) / SR
+    midi_true = 50 + 24 * np.clip((t - 0.5) / 0.5, 0, 1)  # two-octave slide in 0.5 s
+    x = sung(pitch.midi_to_hz(midi_true))
+    trk = pitch.track(x, SR)
+    i = (trk["times"] > 0.55) & (trk["times"] < 0.95) & trk["voiced"]
+    truth = np.interp(trk["times"][i], t, midi_true)
+    assert np.median(np.abs(trk["midi"][i] - truth)) * 100 < 8.0
+
+
+def test_short_onset_notes_are_merged():
+    seq = np.array([62.0] * 5 + [60.0] * 40 + [64.0] * 30)  # 25 ms blip at the onset
+    m = np.concatenate([np.full(5, 61.2), np.full(40, 60.2), np.full(30, 64.1)])
+    out = pitch._merge_short_notes(seq, m, min_frames=12)
+    assert (out[:45] == 60.0).all() and (out[45:] == 64.0).all()

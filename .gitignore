@@ -10,3 +10,4 @@ demo/
 *.wav
 *.mp3
 *.flac
+eval_data/

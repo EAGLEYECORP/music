@@ -114,7 +114,7 @@ def lsd(a: np.ndarray, b: np.ndarray, voiced: np.ndarray) -> float:
 def roughness(x: np.ndarray, voiced: np.ndarray) -> float:
     """Mean YIN aperiodicity (full band) over the steady voiced frames: grain/phase artifacts
     and jitter raise it. Compare against the ideal render of the same voice."""
-    _, cv, _ = pitch._cmnd_candidates(x, SR, 65.0, 1100.0, 240)
+    _, cv, _, _ = pitch._cmnd_candidates(x, SR, 65.0, 1100.0, 240)
     best = np.min(cv, axis=1)
     idx = np.minimum(np.arange(len(best)) * 240, len(voiced) - 1)
     v = voiced[idx]

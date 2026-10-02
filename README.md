@@ -81,6 +81,16 @@ consonants. It then scores the tuner against a perfectly tuned render of the sam
 | breathy voice: notes correct          | 7%   | **100%** |
 | consonants wrongly treated as pitched | 5.8% | 7.6% |
 
+**On real voices** (`python tools/eval_real_voices.py`, which fetches CC-BY LibriSpeech speech
+and a solo trumpet):
+
+- **Tracker:** compared with frames where librosa's pYIN and Praat agree with each other, it is
+  within 50 cents on **99.3–99.9%** of frames. It catches 95–99% of the voiced audio and marks at
+  most 1.1% of unvoiced audio as pitched.
+- **Real voice sung out of tune, then hard-tuned** (measured with Praat, not our own tracker):
+  notes within 10 cents rose from 27–50% to **67–100%**. The deep voice (about 78 Hz) is the
+  weakest case. Speech moves pitch faster within a syllable than sustained singing does.
+
 Known limits: near-whispered singing is still tracked only about 75% of the time. A singer more
 than about 45 cents off sits halfway between two notes, so it snaps to whichever scale note is
 nearer, which may not be the one they meant. Pass `--key` to rule out non-scale notes.
