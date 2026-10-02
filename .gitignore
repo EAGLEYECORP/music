@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+# rendered audio
+out/
+demo/
+*.wav
+*.mp3
+*.flac
