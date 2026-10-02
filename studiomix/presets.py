@@ -31,6 +31,13 @@ class Preset:
     tune_amount: float = 1.0            # 0 = off, 1 = full correction
     tune_retune_ms: float = 25.0        # 0 = instant/robotic (T-Pain), 20-40 = modern pop, 80+ = natural
     tune_humanize: float = 0.35         # how much vibrato / expression survives on held notes (0-1)
+    tune_flex_cents: float = 0.0        # Flex-Tune: leave deviations beyond this alone (0 = correct all)
+
+    # ---- vocal stacks (built from the tuned lead)
+    doubles: bool = False               # two double-tracked copies of the lead, panned wide
+    doubles_db: float = -7.0            # each double vs. the lead
+    harmonies: str = ""                 # comma list of intervals: 3up,3down,4up,5up,5down,6down,8up,8down
+    harmony_db: float = -9.0            # each harmony voice vs. the lead
 
     # ---- ad-libs
     adlib_level_db: float = -5.0        # ad-lib loudness relative to the lead (LU)

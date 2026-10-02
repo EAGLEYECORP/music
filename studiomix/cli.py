@@ -12,6 +12,7 @@ from .presets import PRESETS, TUNE_STYLES, get_preset
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="studiomix",
+        usage="studiomix VOCAL INSTRUMENTAL [options]\n       studiomix serve [--host HOST] [--port PORT]   (phone/browser app)",
         description="Mix a vocal over an instrumental and master it for Spotify, Apple Music, YouTube & co.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="presets:\n" + "\n".join(f"  {p.name:10s} {p.description}" for p in PRESETS.values()),
@@ -40,6 +41,21 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--humanize", dest="tune_humanize", type=float,
                    help="0-1: how much natural vibrato survives on held notes")
     t.add_argument("--tune-amount", dest="tune_amount", type=float, help="0-1 correction strength")
+    t.add_argument("--flex", dest="tune_flex_cents", type=float, metavar="CENTS",
+                   help="Flex-Tune: only correct notes within CENTS of the target; bigger bends, falls "
+                        "and blue notes are left alone (e.g. 35; default off)")
+    t.add_argument("--key-changes", action="store_true",
+                   help="detect a key per song section (for songs that modulate) instead of one key")
+
+    st = ap.add_argument_group("vocal stack (built from the tuned lead)")
+    st.add_argument("--doubles", action="store_const", const=True, default=None,
+                    help="add two double-tracked copies of the lead, panned wide")
+    st.add_argument("--doubles-level", dest="doubles_db", type=float, help="each double vs. the lead in dB (-7)")
+    st.add_argument("--harmony", dest="harmonies", metavar="INTERVALS",
+                    help="harmony voices in key, comma separated: 3up,3down,4up,5up,5down,6down,8up,8down")
+    st.add_argument("--harmony-level", dest="harmony_db", type=float, help="each harmony vs. the lead in dB (-9)")
+    st.add_argument("--stack-at", metavar="RANGES",
+                    help="only stack in these parts, e.g. '0:45-1:15,2:10-2:40' (hooks); default: everywhere")
 
     g = ap.add_argument_group("fine tuning (override the preset)")
     g.add_argument("--lufs", dest="target_lufs", type=float, help="integrated loudness target, e.g. -14, -11, -9")
@@ -61,7 +77,43 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def parse_time_ranges(text: str | None) -> list[tuple[float, float]] | None:
+    """'0:45-1:15, 130-160' -> [(45.0, 75.0), (130.0, 160.0)]."""
+    if not text:
+        return None
+
+    def t(x: str) -> float:
+        x = x.strip()
+        if ":" in x:
+            m, sec = x.split(":", 1)
+            return int(m) * 60 + float(sec)
+        return float(x)
+
+    out = []
+    for part in text.split(","):
+        if part.strip():
+            a, b = part.split("-", 1)
+            a_, b_ = t(a), t(b)
+            if b_ <= a_:
+                raise ValueError(f"bad range '{part.strip()}': end must be after start")
+            out.append((a_, b_))
+    return out or None
+
+
+def check_harmonies(text: str | None) -> None:
+    from .dsp.pitch import HARMONY_STEPS
+
+    for iv in (text or "").split(","):
+        if iv.strip() and iv.strip() not in HARMONY_STEPS:
+            raise ValueError(f"unknown harmony '{iv.strip()}'. choose from: {', '.join(HARMONY_STEPS)}")
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "serve":
+        from .web import serve_main
+
+        return serve_main(argv[1:])
     args = build_parser().parse_args(argv)
     overrides = {}
     if args.tune:
@@ -83,12 +135,14 @@ def main(argv: list[str] | None = None) -> int:
         if not Path(f).is_file():
             print(f"error: file not found: {f}", file=sys.stderr)
             return 1
-    if args.key:
-        try:
+    try:
+        if args.key:
             pitch.parse_key(args.key)
-        except ValueError as e:
-            print(f"error: {e}", file=sys.stderr)
-            return 1
+        check_harmonies(args.harmonies)
+        stack_at = parse_time_ranges(args.stack_at)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
     if not args.quiet:
         print(f"studiomix {__version__} - preset '{preset.name}'")
@@ -98,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
             name=args.name, reference_path=args.reference, vocal_offset_ms=args.offset_ms,
             ceiling_overridden=args.ceiling_dbtp is not None, export_stems=not args.no_stems,
             verbose=not args.quiet, adlib_paths=args.adlibs, key=args.key,
+            key_changes=args.key_changes, stack_at=stack_at,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)

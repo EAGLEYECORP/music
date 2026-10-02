@@ -41,8 +41,8 @@ def _tonal_correction(x, sr, target_db_fn, strength, max_db, f_lo, f_hi, smooth_
 
 # ------------------------------------------------------------------ vocal
 
-def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict, key: tuple[int, str] | None = None,
-                label: str = "vocal", trk: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict, key=None, label: str = "vocal",
+                trk: dict | None = None, capture: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Clean, tune, tone and control a vocal. Returns (dry processed vocal, activity mask)."""
     # stereo vocal files are almost always a mono performance: fold to mono unless truly stereo
     if v.shape[0] >= 2:
@@ -66,10 +66,13 @@ def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict, key: tuple[int, st
 
     # 3. pitch correction, on the clean raw voice (before compression/saturation colour it)
     if key is not None and p.tune_amount > 0:
-        v, stats = pitch.autotune(v, sr, key[0], key[1], p.tune_retune_ms, p.tune_humanize, p.tune_amount,
-                                   trk=trk)
-        log["autotune"] = {"key": pitch.key_name(*key), "retune_ms": p.tune_retune_ms,
-                           "humanize": p.tune_humanize, **stats}
+        sections = isinstance(key, list)  # key per song section
+        tonic, scale = (key, None) if sections else key
+        v, stats = pitch.autotune(v, sr, tonic, scale, p.tune_retune_ms, p.tune_humanize, p.tune_amount,
+                                   trk=trk, flex_cents=p.tune_flex_cents, capture=capture)
+        log["autotune"] = {"key": "per section" if sections else pitch.key_name(*key),
+                           "retune_ms": p.tune_retune_ms, "humanize": p.tune_humanize,
+                           **({"flex_cents": p.tune_flex_cents} if p.tune_flex_cents > 0 else {}), **stats}
 
     # 3b. soft gate (downward expander) for room noise between phrases
     frames = analysis.frame_rms_db(v, sr, 50.0)
@@ -184,6 +187,51 @@ def pan_phrases(v: np.ndarray, sr: int, active: np.ndarray, width: float, start_
         segments.append((0 if i == 0 else a, end, side * width))
         side = -side
     return effects.apply_pan(mono, effects.pan_curve(len(mono), sr, segments))
+
+
+def section_mask(n: int, sr: int, ranges: list[tuple[float, float]] | None, fade_ms: float = 40.0) -> np.ndarray:
+    """0..1 gain curve that is 1 inside the given (start_s, end_s) ranges (all 1s if none)."""
+    if not ranges:
+        return np.ones(n)
+    m = np.zeros(n)
+    for a, b in ranges:
+        m[max(0, int(a * sr)):min(n, int(b * sr))] = 1.0
+    k = max(1, int(sr * fade_ms / 1000))
+    return np.clip(np.convolve(m, np.ones(k) / k, mode="same"), 0.0, 1.0)
+
+
+def build_stack(lead: np.ndarray, sr: int, capture: dict, p: Preset, active: np.ndarray,
+                ranges: list[tuple[float, float]] | None, log: dict) -> np.ndarray | None:
+    """Doubles and harmonies made from the processed, tuned lead. Returns a dry stereo bus."""
+    voices = []
+    if p.doubles:
+        for i, pan in enumerate((-0.8, 0.8)):
+            voices.append(("double", effects.apply_pan(pitch.double(lead, sr, capture, seed=11 + i)[0], pan),
+                           p.doubles_db))
+    ivs = [s_.strip() for s_ in p.harmonies.split(",") if s_.strip()]
+    if ivs and capture.get("key") is not None:
+        for i, iv in enumerate(ivs):
+            pan = (-0.55 if i % 2 == 0 else 0.55) if len(ivs) > 1 else 0.0
+            h = pitch.harmony(lead, sr, capture, iv)[0]
+            voices.append((f"harmony {iv}", effects.apply_pan(h, pan), p.harmony_db))
+    elif ivs:
+        log["harmony_note"] = "harmonies need auto-tune on (they follow the song key)"
+    if not voices:
+        return None
+    mask = section_mask(lead.shape[-1], sr, ranges)
+    on = active & (mask > 0.5)
+    if on.sum() < sr * 0.2:
+        on = active
+    ref = np.sqrt(np.mean(np.mean(lead, axis=0)[on] ** 2)) + 1e-12
+    bus = np.zeros((2, lead.shape[-1]))
+    for name, v, level_db in voices:
+        v = filters.highpass(v, sr, 160.0, order=2)  # stacks stay out of the lead's chest
+        rms = np.sqrt(np.mean(np.mean(v, axis=0)[on] ** 2)) + 1e-12
+        bus += v * (ref / rms) * 10 ** (level_db / 20)
+    log["stack_voices"] = [n for n, _, _ in voices]
+    if ranges:
+        log["stack_sections_s"] = [[round(a, 1), round(b, 1)] for a, b in ranges]
+    return bus * mask[None, :]
 
 
 # ------------------------------------------------------------------ instrumental

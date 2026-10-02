@@ -229,11 +229,18 @@ def track(x: np.ndarray, sr: int, fmin: float = 50.0, fmax: float = 1100.0, adap
 
 def chroma(x: np.ndarray, sr: int) -> np.ndarray:
     """12-bin pitch-class energy profile of a (channels, n) or mono signal."""
+    _, frames = chroma_frames(x, sr)
+    prof = frames.sum(axis=1)
+    return prof / (prof.sum() + 1e-12)
+
+
+def chroma_frames(x: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-frame (~185 ms hop) pitch-class energy: (frame_times_s, (12, n_frames))."""
     mono = np.mean(x, axis=0) if x.ndim == 2 else x
     dec = max(1, sr // 11025)  # 55-2000 Hz needs nothing above ~5.5 kHz
     mono = signal.resample_poly(mono, 1, dec)
     fs = sr / dec
-    f, _, z = signal.stft(mono, fs, nperseg=8192, noverlap=6144)  # ~1.3 Hz bins: resolves low notes
+    f, t, z = signal.stft(mono, fs, nperseg=8192, noverlap=6144)  # ~1.3 Hz bins: resolves low notes
     mag = np.abs(z)
     # keep tonal energy only (median-filter harmonic/percussive split): drums smear chroma
     harm = median_filter(mag, size=(1, 9), mode="nearest")
@@ -243,9 +250,9 @@ def chroma(x: np.ndarray, sr: int) -> np.ndarray:
     m = hz_to_midi(f[keep])
     pcs = np.round(m).astype(int) % 12
     centre = np.clip(1.0 - 2.0 * np.abs(m - np.round(m)), 0.0, 1.0)  # bins between notes count less
-    prof = np.zeros(12)
-    np.add.at(prof, pcs, mag[keep].sum(axis=1) * centre)
-    return prof / (prof.sum() + 1e-12)
+    frames = np.zeros((12, mag.shape[1]))
+    np.add.at(frames, pcs, mag[keep] * centre[:, None])
+    return t, frames
 
 
 def pitch_class_histogram(midi: np.ndarray) -> np.ndarray:
@@ -272,6 +279,109 @@ def detect_key(profile: np.ndarray, melody: np.ndarray | None = None) -> tuple[i
             if score > best[3]:
                 best = (tonic, mode, r, score)
     return best[:3]
+
+
+def _key_scores(profile: np.ndarray, melody: np.ndarray | None) -> np.ndarray:
+    """Score of each of the 24 keys (index = tonic + 12 * (mode == 'minor'))."""
+    out = np.full(24, -2.0)
+    for tonic in range(12):
+        for mi, (mode, prof) in enumerate((("major", _KK_MAJOR), ("minor", _KK_MINOR))):
+            if profile.sum() <= 0:
+                r = 0.0
+            else:
+                r = float(np.corrcoef(profile, np.roll(prof, tonic))[0, 1])
+            score = r
+            if melody is not None and melody.sum() > 0:
+                in_scale = melody[[(tonic + i) % 12 for i in SCALES[mode]]].sum()
+                score += 0.15 * float(np.corrcoef(melody, np.roll(prof, tonic))[0, 1]) + 1.0 * in_scale
+            out[tonic + 12 * mi] = score
+    return out
+
+
+def detect_key_sections(beat: np.ndarray, sr: int, vocal_trk: dict | None = None, window_s: float = 12.0,
+                        hop_s: float = 3.0, switch_cost: float = 1.5, min_section_s: float = 15.0):
+    """Key per song section: [(start_s, end_s, tonic, mode, confidence), ...].
+
+    Key scores are computed on overlapping windows of the beat (plus the melody sung in each
+    window) and a Viterbi path over the 24 keys picks where the key really changes: a change
+    has to pay `switch_cost`, so a borrowed chord or a short fill doesn't flip the key.
+    """
+    t, frames = chroma_frames(beat, sr)
+    dur = beat.shape[-1] / sr
+    starts = np.arange(0.0, max(dur - window_s, 0.0) + 1e-9, hop_s)
+    if len(starts) == 0:
+        starts = np.array([0.0])
+    scores, confs = [], []
+    for w0 in starts:
+        sel = (t >= w0) & (t < w0 + window_s)
+        prof = frames[:, sel].sum(axis=1)
+        mel = None
+        if vocal_trk is not None:
+            vs = (vocal_trk["times"] >= w0) & (vocal_trk["times"] < w0 + window_s)
+            mel = pitch_class_histogram(vocal_trk["midi"][vs])
+        sc = _key_scores(prof, mel)
+        scores.append(sc)
+        confs.append(sc)
+    S = np.array(scores)
+    n = len(S)
+    cost = -S[0].copy()
+    back = np.zeros((n, 24), dtype=np.int32)
+    for i in range(1, n):
+        best_prev = int(np.argmin(cost))
+        stay, switch = cost, cost[best_prev] + switch_cost
+        use = switch < stay
+        back[i] = np.where(use, best_prev, np.arange(24))
+        cost = np.where(use, switch, stay) - S[i]
+    path = np.empty(n, dtype=np.int32)
+    path[-1] = int(np.argmin(cost))
+    for i in range(n - 1, 0, -1):
+        path[i - 1] = back[i, path[i]]
+    # window index -> time: a window is credited to its centre
+    centres = starts + window_s / 2
+    sections = []
+    a = 0
+    for i in range(1, n + 1):
+        if i == n or path[i] != path[a]:
+            s0 = 0.0 if a == 0 else (centres[a - 1] + centres[a]) / 2
+            s1 = dur if i == n else (centres[i - 1] + centres[i]) / 2
+            k = int(path[a])
+            # confidence: the beat's correlation for this key over the section
+            sel = (t >= s0) & (t < s1)
+            r = _key_scores(frames[:, sel].sum(axis=1), None)[k]
+            sections.append([s0, s1, k % 12, "major" if k < 12 else "minor", round(float(r), 2)])
+            a = i
+    # absorb sections that are too short into their longer neighbour
+    while len(sections) > 1:
+        lens = [b - a_ for a_, b, *_ in sections]
+        i = int(np.argmin(lens))
+        if lens[i] >= min_section_s:
+            break
+        j = i - 1 if i > 0 and (i == len(sections) - 1 or lens[i - 1] >= lens[i + 1]) else i + 1
+        lo, hi = min(i, j), max(i, j)
+        keep = sections[j]
+        sections[lo:hi + 1] = [[sections[lo][0], sections[hi][1], keep[2], keep[3], keep[4]]]
+    # merge neighbours that ended up in the same key
+    merged = [sections[0]]
+    for sec in sections[1:]:
+        if sec[2:4] == merged[-1][2:4]:
+            merged[-1][1] = sec[1]
+        else:
+            merged.append(sec)
+    return [tuple(x) for x in merged]
+
+
+KeySpec = "tuple[int, str] | list[tuple[float, float, int, str]]"
+
+
+def _key_at(key, t_s: float) -> tuple[int, str]:
+    """Resolve a single key (tonic, scale) or a list of (start_s, end_s, tonic, scale[, conf]) sections."""
+    if isinstance(key, tuple) and len(key) == 2 and isinstance(key[1], str):
+        return key
+    for sec in key:
+        if sec[0] <= t_s < sec[1]:
+            return int(sec[2]), sec[3]
+    last = key[-1] if t_s >= key[-1][1] else key[0]
+    return int(last[2]), last[3]
 
 
 def parse_key(text: str) -> tuple[int, str]:
@@ -345,12 +455,23 @@ def _merge_short_notes(seq: np.ndarray, m: np.ndarray, min_frames: int) -> np.nd
         seq[a:b] = min(cands, key=lambda c: abs(c - centre))
 
 
-def target_curve(trk: dict, sr: int, tonic: int, scale: str, retune_ms: float, humanize: float,
-                 amount: float = 1.0, hysteresis: float = 0.2) -> np.ndarray:
-    """Corrected pitch (MIDI) per frame; NaN where unvoiced."""
+def _allowed(tonic: int, scale: str) -> np.ndarray:
+    return np.array(sorted({(tonic + i) % 12 for i in SCALES[scale]}))
+
+
+def target_curve(trk: dict, sr: int, tonic, scale: str | None, retune_ms: float, humanize: float,
+                 amount: float = 1.0, hysteresis: float = 0.2, flex_cents: float = 0.0) -> np.ndarray:
+    """Corrected pitch (MIDI) per frame; NaN where unvoiced.
+
+    `tonic`/`scale` give one key; or pass a list of (start_s, end_s, tonic, scale[, conf])
+    sections as `tonic` (scale=None) for songs that change key.
+    flex_cents > 0 (Flex-Tune): notes within `flex_cents` of the target are fully corrected,
+    and correction fades out by `flex_cents + 30` - bigger deviations are treated as intentional
+    bends, falls and blue notes, and left alone.
+    """
+    key = (int(tonic), scale) if scale is not None else tonic
     midi, voiced = trk["midi"], trk["voiced"]
     hop_s = trk["hop"] / sr
-    allowed = np.array(sorted({(tonic + i) % 12 for i in SCALES[scale]}))
     n = len(midi)
 
     # slow pitch (note centre) vs. fast detail (vibrato, scoops) per voiced segment
@@ -367,6 +488,7 @@ def target_curve(trk: dict, sr: int, tonic: int, scale: str, retune_ms: float, h
     target = np.full(n, np.nan)
     since = np.zeros(n)
     for s0, s1 in zip(edges[::2], edges[1::2]):
+        allowed = _allowed(*_key_at(key, (s0 + s1) / 2 * hop_s))  # key at the phrase's midpoint
         notes, path = _note_path(smooth[s0:s1], allowed, sigma=0.5, switch_cost=8.0 + 4.0 * hysteresis)
         seg_target = _merge_short_notes(notes[path], smooth[s0:s1], int(round(0.06 / hop_s)))
         target[s0:s1] = seg_target
@@ -383,7 +505,15 @@ def target_curve(trk: dict, sr: int, tonic: int, scale: str, retune_ms: float, h
     # retune: the note centre is pulled to the target with a time constant of `retune_ms`
     # humanize: vibrato and expression on held notes survive (0 = robotic, 1 = all kept)
     out = target + dev_slow * decay + detail * (decay + (1.0 - decay) * humanize)
-    out = midi + amount * (out - midi)
+    weight = np.full(n, float(amount))
+    if flex_cents > 0:
+        off = np.abs(np.nan_to_num(dev_slow)) * 100.0
+        w = np.clip(1.0 - (off - flex_cents) / 30.0, 0.0, 1.0)
+        # smooth the weight (~30 ms) so it never flutters frame to frame
+        k = max(1, int(round(0.03 / hop_s)))
+        w = np.convolve(w, np.ones(k) / k, mode="same")
+        weight = weight * w
+    out = midi + weight * (out - midi)
     return np.where(voiced, out, np.nan)
 
 
@@ -472,17 +602,30 @@ def psola(x: np.ndarray, sr: int, f0_frames: np.ndarray, ratio_frames: np.ndarra
             ts += period / r
     y = y[maxp: maxp + n]
     wsum = wsum[maxp: maxp + n]
-    # grain coverage is always >= ~0.7 inside the signal (|shift| <= 3 semitones); only the very
-    # edges fall below that, and there the original audio is used
-    return np.where(wsum >= 0.5, y / np.maximum(wsum, 1e-9), x)
+    # Inside the covered span, always normalise the overlap-added grains (big downward shifts,
+    # e.g. a harmony a fifth below, leave thin gaps between grains - that is part of the new,
+    # lower waveform). Only outside the first/last grain is the original audio used.
+    covered = np.zeros(n, dtype=bool)
+    nz = np.flatnonzero(wsum > 1e-3)
+    if len(nz):
+        covered[nz[0]:nz[-1] + 1] = True
+    # y / wsum is a weighted average of grain samples: exact where nothing is shifted, and it
+    # can't spike even where the window weights are tiny.
+    inside = covered & (wsum > 1e-12)
+    return np.where(inside, y / np.where(inside, wsum, 1.0), np.where(covered, 0.0, x))
 
 
-def autotune(x: np.ndarray, sr: int, tonic: int, scale: str, retune_ms: float, humanize: float, amount: float,
-             trk: dict | None = None) -> tuple[np.ndarray, dict]:
-    """Pitch-correct a (channels, n) vocal. Returns (tuned, stats)."""
+def autotune(x: np.ndarray, sr: int, tonic, scale: str | None, retune_ms: float, humanize: float, amount: float,
+             trk: dict | None = None, flex_cents: float = 0.0, capture: dict | None = None):
+    """Pitch-correct a (channels, n) vocal. Returns (tuned, stats).
+
+    `tonic, scale` is one key, or pass key sections as `tonic` with scale=None (see target_curve).
+    If `capture` is a dict, the pitch track and the corrected pitch curve are stored in it
+    (used to build harmonies and doubles from the tuned vocal).
+    """
     mono = np.mean(x, axis=0)
     trk = trk or track(mono, sr)
-    out_midi = target_curve(trk, sr, tonic, scale, retune_ms, humanize, amount)
+    out_midi = target_curve(trk, sr, tonic, scale, retune_ms, humanize, amount, flex_cents=flex_cents)
     shift = np.where(trk["voiced"], out_midi - trk["midi"], 0.0)
     shift = np.clip(np.nan_to_num(shift), -3.0, 3.0)
     ratio = 2.0 ** (shift / 12.0)
@@ -497,4 +640,79 @@ def autotune(x: np.ndarray, sr: int, tonic: int, scale: str, retune_ms: float, h
         "avg_off_pitch_cents_before": round(float(np.mean(np.abs(before)) * 100), 1) if v.any() else 0.0,
         "avg_off_pitch_cents_after": round(float(np.mean(np.abs(after)) * 100), 1) if v.any() else 0.0,
     }
+    if capture is not None:
+        capture.update(trk=trk, out_midi=out_midi, key=(int(tonic), scale) if scale is not None else tonic)
     return tuned, stats
+
+
+# ------------------------------------------------------------------ harmonies & doubles
+
+# scale steps for diatonic intervals; octaves are handled as exactly +-12 semitones
+HARMONY_STEPS = {"3up": 2, "3down": -2, "4up": 3, "5up": 4, "5down": -4, "6down": -5, "8up": 0, "8down": 0}
+
+
+def _scale_step(note: int, steps: int, tonic: int, scale: str) -> int:
+    """The note `steps` scale degrees away from `note` (snapped into the scale first)."""
+    allowed = _allowed(tonic, scale)
+    ladder = np.array([k for k in range(note - 30, note + 31) if k % 12 in allowed])
+    i = int(np.argmin(np.abs(ladder - note)))
+    return int(ladder[np.clip(i + steps, 0, len(ladder) - 1)])
+
+
+def harmony(tuned: np.ndarray, sr: int, capture: dict, interval: str) -> np.ndarray:
+    """A diatonic harmony line built from the tuned vocal: e.g. '3up' sings a third above,
+    following the melody inside the song's key (so it's a major or minor third as the key
+    requires). The voice keeps its own formants (PSOLA), so it sounds like the same singer."""
+    steps = HARMONY_STEPS[interval]
+    trk, out_midi, key = capture["trk"], capture["out_midi"], capture["key"]
+    hop_s = trk["hop"] / sr
+    v = trk["voiced"] & np.isfinite(out_midi)
+    shift = np.zeros(len(out_midi))
+    for i in np.flatnonzero(v):
+        tonic, scale = _key_at(key, i * hop_s)
+        if scale == "chromatic":  # no key information: use major-scale thirds over the note
+            tonic, scale = int(round(out_midi[i])) % 12, "major"
+        note = int(round(out_midi[i]))
+        if interval in ("8up", "8down"):
+            shift[i] = 12.0 if interval == "8up" else -12.0
+        else:
+            shift[i] = _scale_step(note, steps, tonic, scale) - note
+    # hold each note's interval steady (a harmony shouldn't flicker between 3 and 4 semitones)
+    shift = median_filter(shift, size=max(3, int(round(0.04 / hop_s)) | 1), mode="nearest")
+    shift = np.where(v, shift, 0.0)
+    ratio = 2.0 ** (shift / 12.0)
+    f0 = np.where(v, midi_to_hz(np.nan_to_num(out_midi, nan=60.0)), np.nan)
+    return np.vstack([psola(ch, sr, f0, ratio, trk["hop"]) for ch in np.atleast_2d(tuned)])
+
+
+def double(tuned: np.ndarray, sr: int, capture: dict, seed: int, detune_cents: float = 8.0,
+           max_delay_ms: float = 22.0) -> np.ndarray:
+    """A 'double track': the same performance re-sung - slightly late or early by a slowly
+    wandering 5-22 ms and a few cents sharp or flat - which is what makes stacked vocals thick."""
+    rng = np.random.default_rng(seed)
+    trk, out_midi = capture["trk"], capture["out_midi"]
+    n_fr = len(out_midi)
+    hop_s = trk["hop"] / sr
+
+    def wander(n, rate_hz):
+        # smooth random curve in [-1, 1], about `rate_hz` changes per second
+        k = max(2, int(n * hop_s * rate_hz) + 2)
+        pts = rng.uniform(-1, 1, k)
+        return np.interp(np.linspace(0, k - 1, n), np.arange(k), pts)
+
+    v = trk["voiced"] & np.isfinite(out_midi)
+    shift_c = wander(n_fr, 1.5) * detune_cents
+    ratio = np.where(v, 2.0 ** (shift_c / 1200.0), 1.0)
+    f0 = np.where(v, midi_to_hz(np.nan_to_num(out_midi, nan=60.0)), np.nan)
+    x = np.atleast_2d(tuned)
+    y = np.vstack([psola(ch, sr, f0, ratio, trk["hop"]) for ch in x])
+    # time wobble: variable delay line (cubic interpolation), never ahead of the lead by > 5 ms
+    n = y.shape[-1]
+    d_fr = 5.0 + (wander(n_fr, 0.7) * 0.5 + 0.5) * (max_delay_ms - 5.0)
+    d = np.interp(np.arange(n), np.arange(n_fr) * trk["hop"], d_fr) * sr / 1000.0
+    pad = int(max_delay_ms * sr / 1000) + 4
+    out = []
+    for ch in y:
+        chp = np.pad(ch, (pad, 4))
+        out.append(_cubic(chp, np.arange(n) - d + pad))
+    return np.vstack(out)

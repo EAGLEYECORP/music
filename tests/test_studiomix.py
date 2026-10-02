@@ -267,3 +267,81 @@ def test_short_onset_notes_are_merged():
     m = np.concatenate([np.full(5, 61.2), np.full(40, 60.2), np.full(30, 64.1)])
     out = pitch._merge_short_notes(seq, m, min_frames=12)
     assert (out[:45] == 60.0).all() and (out[45:] == 64.0).all()
+
+
+# ------------------------------------------------------------------ new features
+
+
+@pytest.fixture(scope="module")
+def tuned_two_notes():
+    t = np.arange(SR * 3) / SR
+    x = sung(np.where(t < 1.5, pitch.midi_to_hz(57.2), pitch.midi_to_hz(60.15)))  # A3, C4 (a bit sharp)
+    cap = {}
+    y, _ = pitch.autotune(x[None], SR, 0, "major", 0, 0, 1.0, capture=cap)
+    return y, cap
+
+
+@pytest.mark.parametrize("interval,expect_a3,expect_c4", [
+    ("3up", 60, 64), ("3down", 53, 57), ("5up", 64, 67), ("5down", 50, 53), ("8up", 69, 72), ("8down", 45, 48),
+])
+def test_harmony_intervals_follow_the_key(tuned_two_notes, interval, expect_a3, expect_c4):
+    y, cap = tuned_two_notes
+    h = pitch.harmony(y, SR, cap, interval)
+    # measure each half within +-5 semitones of the expected note (verified against Praat too;
+    # our own tracker can octave-jump on heavily overlapped PSOLA grains, which is unrelated)
+    for sl, exp in ((slice(0, SR * 3 // 2), expect_a3), (slice(SR * 3 // 2, SR * 3), expect_c4)):
+        f = float(pitch.midi_to_hz(exp))
+        tr = pitch.track(h[0, sl], SR, fmin=f / 1.33, fmax=f * 1.33, adapt=False)
+        assert np.nanmedian(tr["midi"][60:230]) == pytest.approx(exp, abs=0.1)
+
+
+def test_double_is_late_and_close_in_pitch(tuned_two_notes):
+    y, cap = tuned_two_notes
+    d = pitch.double(y, SR, cap, seed=3)
+    tr = pitch.track(d[0], SR)
+    assert np.nanmedian(tr["midi"][60:250]) == pytest.approx(57.0, abs=0.12)
+    # onset of the double comes 5-22 ms after the lead's
+    on = lambda z: np.argmax(np.abs(z) > 0.05 * np.max(np.abs(z)))  # noqa: E731
+    lag_ms = (on(d[0]) - on(y[0])) / SR * 1000
+    assert 4.0 <= lag_ms <= 23.0
+
+
+def test_flex_tune_leaves_intentional_bends():
+    t = np.arange(SR * 3) / SR
+    x = sung(np.where(t < 1.5, pitch.midi_to_hz(57.25), pitch.midi_to_hz(57.8)))
+    y, _ = pitch.autotune(x[None], SR, 0, "major", 0, 0, 1.0, flex_cents=35)
+    tr = pitch.track(y[0], SR)
+    assert np.nanmedian(tr["midi"][60:250]) == pytest.approx(57.0, abs=0.05)   # 25c off: corrected
+    assert np.nanmedian(tr["midi"][360:560]) == pytest.approx(57.8, abs=0.05)  # 80c bend: kept
+
+
+def test_key_change_detection():
+    a = make_demo.beat(44100, 30.0)
+    b = audio_io.resample(make_demo.beat(44100, 36.0), int(round(44100 * 2 ** (3 / 12))), 44100)[:, : 44100 * 30]
+    secs = pitch.detect_key_sections(np.concatenate([a, b], axis=1), 44100)
+    assert [(s[2], s[3]) for s in secs] == [(9, "minor"), (0, "minor")]
+    assert abs(secs[0][1] - 30.0) < 3.0
+    assert len(pitch.detect_key_sections(a, 44100)) == 1
+
+
+def test_time_ranges_and_section_mask():
+    from studiomix.cli import parse_time_ranges
+
+    assert parse_time_ranges("0:45-1:15, 130-160") == [(45.0, 75.0), (130.0, 160.0)]
+    with pytest.raises(ValueError):
+        parse_time_ranges("1:00-0:30")
+    m = chains.section_mask(SR * 10, SR, [(2.0, 4.0)])
+    assert m[int(SR * 1)] == 0 and m[int(SR * 3)] == 1 and m[int(SR * 6)] == 0
+
+
+def test_end_to_end_with_stack(demo_files, tmp_path):
+    from studiomix.engine import run
+
+    d = demo_files
+    p = get_preset("trap", doubles=True, harmonies="3up")
+    log = run(d / "v.wav", d / "b.wav", tmp_path, p, name="s", verbose=False, stack_at=[(3.0, 9.0)])
+    assert log["stack"]["stack_voices"] == ["double", "double", "harmony 3up"]
+    st, sr = audio_io.load(tmp_path / log["files"]["stack_stem"])
+    rms = lambda a, b: np.sqrt(np.mean(st[:, int(a * sr):int(b * sr)] ** 2))  # noqa: E731
+    assert rms(0.0, 2.5) < 1e-6 < rms(4.0, 8.0)
+    assert log["output"]["true_peak_dbtp"] <= log["master"]["ceiling_dbtp"] + 0.01
