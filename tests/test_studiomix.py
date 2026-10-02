@@ -649,3 +649,35 @@ def test_denoise_leaves_clean_takes_alone():
     clean, noisy, act = _noisy_take(50)
     out, st = denoise(noisy[None], SR, act)
     assert st["applied"] is False and np.array_equal(out[0], noisy)
+
+
+def test_studio_comping_trim_nudge_gain(tmp_path, demo_files):
+    from studiomix import studio
+
+    def wav_bytes(x, sr=48000):
+        p = tmp_path / "tmp.wav"
+        audio_io.write_wav(p, x, sr, 32)
+        return p.read_bytes()
+
+    studio.save_beat(tmp_path, "hook", "beat.wav", (demo_files / "b.wav").read_bytes())
+    tone = np.sin(2 * np.pi * 220 * np.arange(48000 * 2) / 48000)[None, :] * 0.3
+    # a loop recording: 3 passes of the same section; the last one is active by default
+    passes = [studio.add_take(tmp_path, "hook", wav_bytes(tone * g), "lead", 2.0, 100, group="g1", active=(i == 2))
+              for i, g in enumerate((0.2, 0.5, 1.0))]
+    info = studio.info(tmp_path, "hook")
+    assert [t["active"] for t in info["takes"]] == [False, False, True]
+    # pick pass 1, trim 0.5 s off its start, nudge it 20 ms earlier, +6 dB
+    info = studio.update_take(tmp_path, "hook", passes[0]["id"],
+                              {"active": "1", "trim_start_s": "0.5", "nudge_ms": "-20", "gain_db": "6"})
+    assert [t["active"] for t in info["takes"]] == [True, False, False]
+    tr = studio.build_tracks(tmp_path, "hook")
+    lead, sr = audio_io.load(tr["lead"])
+    nz = np.flatnonzero(np.abs(lead[0]) > 1e-4)
+    assert nz[0] / sr == pytest.approx(2.0 + 0.5 - 0.02, abs=0.012)  # trimmed + nudged start
+    assert np.max(np.abs(lead)) == pytest.approx(0.06 * 2.0, rel=0.05)  # pass 1 (0.2 * 0.3) at +6 dB
+    with pytest.raises(ValueError):
+        studio.update_take(tmp_path, "hook", "0000000000", {"active": "1"})
+    # setting every lead take aside leaves nothing to mix
+    studio.update_take(tmp_path, "hook", passes[0]["id"], {"active": "0"})
+    with pytest.raises(ValueError):
+        studio.build_tracks(tmp_path, "hook")

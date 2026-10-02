@@ -70,7 +70,8 @@ def save_beat(root: Path, session: str, filename: str, data: bytes) -> dict:
     return meta["beat"]
 
 
-def add_take(root: Path, session: str, data: bytes, role: str, offset_s: float, latency_ms: float) -> dict:
+def add_take(root: Path, session: str, data: bytes, role: str, offset_s: float, latency_ms: float,
+             group: str = "", active: bool = True) -> dict:
     if role not in ROLES:
         raise ValueError(f"role must be one of {ROLES}")
     d = session_dir(root, session)
@@ -81,16 +82,56 @@ def add_take(root: Path, session: str, data: bytes, role: str, offset_s: float, 
     peak = float(np.max(np.abs(x))) if x.size else 0.0
     take = {"id": tid, "role": role, "offset_s": round(max(0.0, float(offset_s)), 3),
             "duration_s": round(x.shape[-1] / sr, 2), "sr": sr, "latency_ms": round(float(latency_ms), 1),
-            "peak_dbfs": round(20 * np.log10(peak + 1e-12), 1), "created": time.strftime("%H:%M:%S")}
+            "peak_dbfs": round(20 * np.log10(peak + 1e-12), 1), "created": time.strftime("%H:%M:%S"),
+            # comping / editing
+            "active": bool(active), "group": re.sub(r"[^0-9a-z]", "", group.lower())[:16],
+            "trim_start_s": 0.0, "trim_end_s": 0.0, "gain_db": 0.0, "nudge_ms": 0.0}
     if peak >= 0.999:
         take["warning"] = "clipped - move the phone a bit further away or sing softer"
     elif peak < 10 ** (-40 / 20):
         take["warning"] = "very quiet - is the right microphone selected?"
     with _lock:
         meta = _meta(d)
+        if take["group"] and take["active"]:  # one active pass per loop recording
+            for t in meta["takes"]:
+                if t.get("group") == take["group"]:
+                    t["active"] = False
         meta["takes"].append(take)
         _save_meta(d, meta)
     return take
+
+
+EDITABLE = {"active": bool, "trim_start_s": float, "trim_end_s": float, "gain_db": float, "nudge_ms": float}
+LIMITS = {"gain_db": (-24.0, 12.0), "nudge_ms": (-500.0, 500.0)}
+
+
+def update_take(root: Path, session: str, tid: str, changes: dict) -> dict:
+    """Comp/edit a take: use it or not, trim its start/end, nudge its timing, change its level.
+    Using a pass of a loop recording sets the other passes of that loop aside."""
+    d = session_dir(root, session)
+    with _lock:
+        meta = _meta(d)
+        take = next((t for t in meta["takes"] if t["id"] == tid), None)
+        if take is None:
+            raise ValueError("no such take")
+        for k, conv in EDITABLE.items():
+            if k not in changes:
+                continue
+            v = changes[k]
+            v = (str(v).lower() in ("1", "true", "on", "yes")) if conv is bool else float(v)
+            if k in LIMITS:
+                v = float(np.clip(v, *LIMITS[k]))
+            if k in ("trim_start_s", "trim_end_s"):
+                v = float(np.clip(v, 0.0, max(0.0, take["duration_s"] - 0.1)))
+            take[k] = v
+        if take["trim_start_s"] + take["trim_end_s"] > take["duration_s"] - 0.1:
+            take["trim_end_s"] = max(0.0, take["duration_s"] - 0.1 - take["trim_start_s"])
+        if take.get("active") and take.get("group"):
+            for t in meta["takes"]:
+                if t is not take and t.get("group") == take["group"]:
+                    t["active"] = False
+        _save_meta(d, meta)
+    return info(root, session)
 
 
 def delete_take(root: Path, session: str, tid: str) -> None:
@@ -120,19 +161,32 @@ def build_tracks(root: Path, session: str) -> dict:
     meta = _meta(d)
     if not meta["beat"]:
         raise ValueError("upload a beat first")
-    if not any(t["role"] == "lead" for t in meta["takes"]):
-        raise ValueError("record at least one lead take")
+    if not any(t["role"] == "lead" and t.get("active", True) for t in meta["takes"]):
+        raise ValueError("record (or ★ select) at least one lead take")
     beat_path = d / meta["beat"]["file"]
     out = {"beat": beat_path}
     sr = 48000
     for role in ROLES:
-        takes = [t for t in meta["takes"] if t["role"] == role]
+        takes = [t for t in meta["takes"] if t["role"] == role and t.get("active", True)]
         if not takes:
             continue
         clips = []
         for t in takes:
             x, tsr = audio_io.load(d / "takes" / f"{t['id']}.wav")
-            clips.append((t["offset_s"], audio_io.resample(np.mean(x, axis=0, keepdims=True), tsr, sr)))
+            x = np.mean(x, axis=0, keepdims=True)
+            a = int(round(t.get("trim_start_s", 0.0) * tsr))
+            b = x.shape[-1] - int(round(t.get("trim_end_s", 0.0) * tsr))
+            x = x[:, a:max(a + 1, b)] * 10 ** (t.get("gain_db", 0.0) / 20)
+            fade = min(x.shape[-1] // 2, int(0.01 * tsr))  # 10 ms fades: trimmed edges never click
+            if fade > 0:
+                ramp = np.linspace(0.0, 1.0, fade)
+                x[:, :fade] *= ramp
+                x[:, -fade:] *= ramp[::-1]
+            start = t["offset_s"] + t.get("trim_start_s", 0.0) + t.get("nudge_ms", 0.0) / 1000.0
+            if start < 0:  # nudged before the song start
+                x = x[:, int(round(-start * tsr)):]
+                start = 0.0
+            clips.append((start, audio_io.resample(x, tsr, sr)))
         n = max(int(o * sr) + c.shape[-1] for o, c in clips)
         track = np.zeros((1, n))
         for o, c in clips:

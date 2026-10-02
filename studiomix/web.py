@@ -198,7 +198,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        st = re.fullmatch(r"/api/studio/([A-Za-z0-9_-]{1,40})/(beat|take|delete/([0-9a-f]{10}))", self.path)
+        st = re.fullmatch(r"/api/studio/([A-Za-z0-9_-]{1,40})/(beat|take|delete/([0-9a-f]{10})|update/([0-9a-f]{10}))",
+                          self.path)
         if self.path not in ("/api/jobs", "/api/learn") and not st:
             return self._json(404, {"error": "not found"})
         if st and st.group(3):
@@ -218,6 +219,9 @@ class Handler(BaseHTTPRequestHandler):
             from . import studio
 
             try:
+                if st.group(4):
+                    return self._json(200, studio.update_take(self.jobs_dir, st.group(1), st.group(4),
+                                                              {k: v[0] for k, v in fields.items()}))
                 if st.group(2) == "beat":
                     if not files.get("beat"):
                         return self._json(400, {"error": "choose a beat"})
@@ -226,7 +230,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not files.get("take"):
                         return self._json(400, {"error": "no audio received"})
                     studio.add_take(self.jobs_dir, st.group(1), files["take"][0][1], f("role", "lead"),
-                                    float(f("offset_s", "0") or 0), float(f("latency_ms", "0") or 0))
+                                    float(f("offset_s", "0") or 0), float(f("latency_ms", "0") or 0),
+                                    group=f("group"), active=f("active", "1") != "0")
             except (ValueError, RuntimeError) as e:
                 return self._json(400, {"error": str(e)})
             return self._json(200, studio.info(self.jobs_dir, st.group(1)))
@@ -262,8 +267,8 @@ class Handler(BaseHTTPRequestHandler):
                 info = studio.info(self.jobs_dir, f("session"))
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
-            if not info["beat"] or not any(t["role"] == "lead" for t in info["takes"]):
-                return self._json(400, {"error": "load a beat and record at least one lead take first"})
+            if not info["beat"] or not any(t["role"] == "lead" and t.get("active", True) for t in info["takes"]):
+                return self._json(400, {"error": "load a beat and record (or ★ select) at least one lead take first"})
         if mode == "mix" and not files.get("mix"):
             return self._json(400, {"error": "choose your mix file"})
         if mode == "stems" and (not files.get("lead") or not files.get("beat")):
@@ -477,6 +482,15 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
   padding: 8px 12px; font: 600 14px system-ui, sans-serif; cursor: pointer; }
 .tag { font-size: 11px; font-weight: 700; padding: 3px 7px; border-radius: 6px; background: var(--chip); text-transform: uppercase; }
 .tag.lead { background: var(--accent); color: var(--accent-ink); }
+.takes li { flex-wrap: wrap; }
+.takes li.off { opacity: .45; }
+.takes canvas { width: 100%; height: 34px; display: block; margin-top: 6px; border-radius: 6px; background: var(--chip); }
+.takes .star { font-size: 18px; padding: 6px 10px; }
+.takes .star.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.edit { width: 100%; display: grid; gap: 6px; padding: 8px 0 2px; }
+.edit[hidden] { display: none; }
+.edit label { display: grid; grid-template-columns: 92px 1fr 64px; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.edit output { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
 #diag { margin: 0 0 12px; padding-left: 18px; font-size: 14px; }
 #diag li { margin: 4px 0; }
 .muted { color: var(--muted); font-size: 13px; }
@@ -509,10 +523,14 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
       <input type="radio" name="role" id="r1" value="lead" checked><label for="r1">Lead</label>
       <input type="radio" name="role" id="r2" value="adlib"><label for="r2">Ad-lib</label>
     </div>
-    <div style="display:flex;gap:8px;margin-top:8px">
-      <input type="text" id="startat" value="0:00" style="width:110px" aria-label="start at">
-      <div class="hint" style="align-self:center">start at (the beat starts 3 s before, so you hear the lead-in)</div>
+    <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+      <input type="text" id="startat" value="0:00" style="width:92px" aria-label="start at">
+      <span class="hint">→</span>
+      <input type="text" id="endat" placeholder="end" style="width:92px" aria-label="end at">
+      <label class="hint" style="display:flex;gap:6px;align-items:center;margin-left:auto">Loop
+        <label class="switch"><input type="checkbox" id="loopon"><span></span></label></label>
     </div>
+    <div class="hint">You hear 3 s of beat before the start. Loop: the section repeats and every pass is kept - ★ the best one.</div>
     <div class="rec">
       <button type="button" class="recbtn" id="recbtn">REC</button>
       <div class="meter"><div class="lvl"><i id="lvl"></i></div><div class="time" id="rectime">0:00.0</div>
@@ -683,7 +701,7 @@ document.querySelectorAll("input[name=mode]").forEach(r => r.addEventListener("c
 setMode();
 const STEPS_EST = 9;
 const Studio = (() => {
-  let ctx = null, beatBuf = null, beatFor = null, stream = null, recording = null, info = null;
+  let ctx = null, beatBuf = null, beatFor = null, stream = null, recording = null, info = null, uploading = false;
   const ls = (k, d) => { try { return localStorage.getItem(k) ?? d; } catch (_) { return d; } };
   const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} };
   let latencyMs = +ls("sm_latency", "0");
@@ -759,13 +777,31 @@ const Studio = (() => {
     $("#beatname").textContent = info && info.beat ? `${info.beat.name} · ${fmt(info.beat.duration_s)}` : "Tap to choose (saved with the song)";
     $("#studiobeat").closest("label").classList.toggle("has", !!(info && info.beat));
     const ul = $("#takes"); ul.innerHTML = "";
-    ((info && info.takes) || []).slice().sort((a, b) => a.offset_s - b.offset_s).forEach(t => {
-      const li = document.createElement("li");
-      li.innerHTML = `<span class="tag ${t.role}">${t.role === "lead" ? "Lead" : "Ad-lib"}</span>
-        <div class="grow"><div>${fmt(t.offset_s)} → ${fmt(t.offset_s + t.duration_s)}</div>
+    const takes = ((info && info.takes) || []).slice().sort((a, b) => a.offset_s - b.offset_s || a.created.localeCompare(b.created));
+    const passNo = {}, groupCount = {};
+    takes.forEach(t => { if (t.group) groupCount[t.group] = (groupCount[t.group] || 0) + 1; });
+    takes.forEach(t => {
+      const on = t.active !== false, li = document.createElement("li");
+      if (t.group) passNo[t.group] = (passNo[t.group] || 0) + 1;
+      li.className = on ? "" : "off";
+      const ts = t.trim_start_s || 0, te = t.trim_end_s || 0;
+      li.innerHTML = `<button type="button" class="star ${on ? "on" : ""}" data-star="${t.id}" title="use this take">★</button>
+        <span class="tag ${t.role}">${t.role === "lead" ? "Lead" : "Ad-lib"}</span>
+        <div class="grow"><div>${fmt(t.offset_s + ts)} → ${fmt(t.offset_s + t.duration_s - te)}
+          ${t.group ? `<span class="muted"> · pass ${passNo[t.group]}/${groupCount[t.group]}</span>` : ""}</div>
         ${t.warning ? `<div class="warn">${t.warning}</div>` : ""}</div>
-        <button type="button" data-play="${t.id}">▶</button><button type="button" data-del="${t.id}">🗑</button>`;
+        <button type="button" data-play="${t.id}">▶</button><button type="button" data-edit="${t.id}">✎</button>
+        <button type="button" data-del="${t.id}">🗑</button>
+        <canvas data-wave="${t.id}" width="600" height="34"></canvas>
+        <div class="edit" data-panel="${t.id}" hidden>
+          <label>Trim start <input type="range" name="trim_start_s" min="0" max="${t.duration_s}" step="0.05" value="${ts}"><output>${ts.toFixed(2)} s</output></label>
+          <label>Trim end <input type="range" name="trim_end_s" min="0" max="${t.duration_s}" step="0.05" value="${te}"><output>${te.toFixed(2)} s</output></label>
+          <label>Nudge <input type="range" name="nudge_ms" min="-150" max="150" step="5" value="${t.nudge_ms || 0}"><output>${t.nudge_ms || 0} ms</output></label>
+          <label>Volume <input type="range" name="gain_db" min="-12" max="12" step="0.5" value="${t.gain_db || 0}"><output>${t.gain_db || 0} dB</output></label>
+          <button type="button" class="mini" data-save="${t.id}">Save edit</button>
+        </div>`;
       ul.appendChild(li);
+      drawWave(t);
     });
     if (!ul.children.length) ul.innerHTML = '<li class="muted">No takes yet</li>';
   }
@@ -774,15 +810,39 @@ const Studio = (() => {
     lsSet("sm_session", $("#session").value);
     info = await (await fetch(`/api/studio/${s_}`)).json(); render();
   }
+  const waves = {};
+  async function drawWave(t) {
+    const cv = document.querySelector(`canvas[data-wave="${t.id}"]`); if (!cv) return;
+    try {
+      if (!waves[t.id]) {
+        const c = await audio(), b = await c.decodeAudioData(await (await fetch(`/studio/${session()}/take/${t.id}`)).arrayBuffer());
+        const d = b.getChannelData(0), n = cv.width, step = Math.max(1, Math.floor(d.length / n)), pk = new Float32Array(n);
+        for (let i = 0; i < n; i++) { let m = 0; for (let j = i * step; j < Math.min(d.length, (i + 1) * step); j += 4) m = Math.max(m, Math.abs(d[j])); pk[i] = m; }
+        waves[t.id] = pk;
+      }
+      const pk = waves[t.id], g = cv.getContext("2d"), W = cv.width, H = cv.height;
+      const css = getComputedStyle(document.documentElement);
+      g.clearRect(0, 0, W, H);
+      const a = (t.trim_start_s || 0) / t.duration_s * W, b = W - (t.trim_end_s || 0) / t.duration_s * W;
+      for (let i = 0; i < W; i++) {
+        const h = Math.max(1, pk[i] * H);
+        g.fillStyle = (i >= a && i <= b) ? css.getPropertyValue("--accent") : css.getPropertyValue("--line");
+        g.fillRect(i, (H - h) / 2, 1, h);
+      }
+    } catch (_) {}
+  }
   let playing = [];
   function stopPlay() { playing.forEach(n => { try { n.stop(); } catch (_) {} }); playing = []; }
   async function playTake(id) {
     stopPlay(); const t = info.takes.find(x => x.id === id), c = await audio(), beat = await loadBeat();
     const tb = await c.decodeAudioData(await (await fetch(`/studio/${session()}/take/${id}`)).arrayBuffer());
-    const when = c.currentTime + 0.1, pre = Math.min(2, t.offset_s);
+    const ts = t.trim_start_s || 0, te = t.trim_end_s || 0, nudge = (t.nudge_ms || 0) / 1000;
+    const at = Math.max(0, t.offset_s + ts + nudge), pre = Math.min(2, at), when = c.currentTime + 0.1;
     const g = c.createGain(); g.gain.value = +$("#beatvol").value; g.connect(c.destination);
-    if (beat) { const b = c.createBufferSource(); b.buffer = beat; b.connect(g); b.start(when, t.offset_s - pre); playing.push(b); }
-    const v = c.createBufferSource(); v.buffer = tb; v.connect(c.destination); v.start(when + pre); playing.push(v);
+    if (beat) { const b = c.createBufferSource(); b.buffer = beat; b.connect(g); b.start(when, at - pre); playing.push(b); }
+    const vg = c.createGain(); vg.gain.value = Math.pow(10, (t.gain_db || 0) / 20); vg.connect(c.destination);
+    const v = c.createBufferSource(); v.buffer = tb; v.connect(vg);
+    v.start(when + pre, ts, Math.max(0.05, t.duration_s - ts - te)); playing.push(v);
   }
   async function record() {
     const btn = $("#recbtn");
@@ -792,17 +852,38 @@ const Studio = (() => {
       const {data, first} = r.cap.stop();
       // beat position p was heard at context time t0 + (p - playFrom); the voice answering it
       // reaches the recorder `latency` later. Keep the audio from the take's start position on.
-      const startFrame = Math.round((r.t0 + (r.startAt - r.playFrom) + latencyMs / 1000) * r.sr) - first;
-      const take = startFrame >= 0 ? data.subarray(startFrame) : data;
-      if (take.length < r.sr * 0.3) { $("#rechint").textContent = "Too short - nothing saved."; return; }
-      $("#rechint").textContent = "Saving take…";
-      const fd = new FormData();
-      fd.append("take", wav(take, r.sr), "take.wav"); fd.append("role", r.role);
-      fd.append("offset_s", r.startAt.toFixed(3)); fd.append("latency_ms", latencyMs);
-      const res = await fetch(`/api/studio/${session()}/take`, {method: "POST", body: fd});
-      const j = await res.json(); if (!res.ok) { $("#rechint").textContent = j.error; return; }
+      const base = (r.t0 + (r.startAt - r.playFrom) + latencyMs / 1000) * r.sr - first;
+      let passes = [];
+      if (r.loopLen) {  // one take per pass of the loop
+        const L = Math.round(r.loopLen * r.sr);
+        for (let k = 0; ; k++) {
+          const a = Math.round(base + k * L); if (a >= data.length) break;
+          const seg = data.subarray(Math.max(0, a), Math.min(data.length, a + L));
+          if (seg.length >= Math.max(r.sr * 0.3, L * 0.3)) passes.push(seg);
+        }
+      } else {
+        const a = Math.round(base); passes = [a >= 0 ? data.subarray(a) : data];
+      }
+      passes = passes.filter(p => p.length >= r.sr * 0.3);
+      if (!passes.length) { $("#rechint").textContent = "Too short - nothing saved."; return; }
+      const group = r.loopLen ? Math.random().toString(36).slice(2, 10) : "";
+      let j = null;
+      for (let k = 0; k < passes.length; k++) {
+        $("#rechint").textContent = passes.length > 1 ? `Saving pass ${k + 1}/${passes.length}…` : "Saving take…";
+        const fd = new FormData();
+        fd.append("take", wav(passes[k], r.sr), "take.wav"); fd.append("role", r.role);
+        fd.append("offset_s", r.startAt.toFixed(3)); fd.append("latency_ms", latencyMs);
+        fd.append("group", group);
+        // in a loop, the last complete pass is used by default (you usually get better each time)
+        const full = !r.loopLen || passes[k].length >= Math.round(r.loopLen * r.sr) * 0.95;
+        const lastFull = passes.map(p => !r.loopLen || p.length >= Math.round(r.loopLen * r.sr) * 0.95).lastIndexOf(true);
+        fd.append("active", (!r.loopLen || k === (lastFull >= 0 ? lastFull : passes.length - 1)) ? "1" : "0");
+        const res = await fetch(`/api/studio/${session()}/take`, {method: "POST", body: fd});
+        j = await res.json(); if (!res.ok) { $("#rechint").textContent = j.error; return; }
+      }
       info = j; render(); const last = j.takes[j.takes.length - 1];
-      $("#rechint").textContent = last.warning ? "Saved - " + last.warning : "Saved. Tap ▶ to hear it with the beat.";
+      $("#rechint").textContent = last.warning ? "Saved - " + last.warning
+        : passes.length > 1 ? `Saved ${passes.length} passes - ★ the best one.` : "Saved. Tap ▶ to hear it with the beat.";
       return;
     }
     if (!session()) { alert("Give the song a name first"); return; }
@@ -811,15 +892,22 @@ const Studio = (() => {
       const c = await audio(), beat = await loadBeat();
       if (!beat) { alert("Choose a beat first"); return; }
       const startAt = parseT($("#startat").value), playFrom = Math.max(0, startAt - 3);
+      const endAt = parseT($("#endat").value), looping = $("#loopon").checked;
+      if (looping && !(endAt > startAt + 1)) { alert("For loop recording set an end time after the start"); return; }
       let peakHold = 0;
       const cap = await capture(pk => { peakHold = Math.max(pk, peakHold * 0.8);
         const el = $("#lvl"); el.style.width = Math.min(100, peakHold * 100) + "%"; el.classList.toggle("hot", pk > 0.95); });
       const g = c.createGain(); g.gain.value = +$("#beatvol").value; g.connect(c.destination);
       const src = c.createBufferSource(); src.buffer = beat; src.connect(g);
+      if (looping) { src.loop = true; src.loopStart = startAt; src.loopEnd = Math.min(endAt, beat.duration); }
       const t0 = c.currentTime + 0.2; src.start(t0, playFrom);
       const role = document.querySelector("input[name=role]:checked").value;
-      const timer = setInterval(() => { $("#rectime").textContent = fmt(playFrom + c.currentTime - t0); }, 100);
-      recording = {cap, src, t0, startAt, playFrom, sr: c.sampleRate, role, timer};
+      const loopLen = looping ? Math.min(endAt, beat.duration) - startAt : 0;
+      const timer = setInterval(() => {
+        let pos = playFrom + c.currentTime - t0, pass = "";
+        if (loopLen && pos > startAt) { const k = Math.floor((pos - startAt) / loopLen); pos = startAt + (pos - startAt) % loopLen; pass = `  ·  pass ${k + 1}`; }
+        $("#rectime").textContent = fmt(pos) + pass; }, 100);
+      recording = {cap, src, t0, startAt, playFrom, sr: c.sampleRate, role, timer, loopLen};
       src.onended = () => { if (recording) record(); };
       btn.classList.add("on"); btn.textContent = "STOP";
       $("#rechint").textContent = startAt > playFrom ? `Lead-in… your part starts at ${fmt(startAt)}` : "Recording…";
@@ -856,16 +944,35 @@ const Studio = (() => {
   $("#studiobeat").addEventListener("change", async e => {
     if (!session()) { alert("Give the song a name first"); e.target.value = ""; return; }
     const fd = new FormData(); fd.append("beat", e.target.files[0]);
-    $("#beatname").textContent = "Uploading…";
-    const res = await fetch(`/api/studio/${session()}/beat`, {method: "POST", body: fd}); const j = await res.json();
-    if (!res.ok) { alert(j.error); } else { info = j; beatBuf = null; render(); }
+    $("#beatname").textContent = "Uploading…"; uploading = true; $("#recbtn").disabled = true;
+    try {
+      const res = await fetch(`/api/studio/${session()}/beat`, {method: "POST", body: fd}); const j = await res.json();
+      if (!res.ok) { alert(j.error); } else { info = j; beatBuf = null; }
+    } finally { uploading = false; $("#recbtn").disabled = false; render(); }
   });
   $("#recbtn").addEventListener("click", record);
   $("#calib").addEventListener("click", calibrate);
   $("#latval").addEventListener("click", () => { const v = prompt("Earbud delay in ms", Math.round(latencyMs));
     if (v !== null && !isNaN(+v)) { latencyMs = +v; lsSet("sm_latency", String(latencyMs)); render(); } });
+  $("#takes").addEventListener("input", e => {
+    const o = e.target.parentElement.querySelector("output"); if (!o) return;
+    const u = {trim_start_s: " s", trim_end_s: " s", nudge_ms: " ms", gain_db: " dB"}[e.target.name];
+    o.textContent = (+e.target.value).toFixed(e.target.name.startsWith("trim") ? 2 : 1).replace(/\.0$/, "") + u;
+  });
+  async function updateTake(id, fields) {
+    const fd = new FormData(); Object.entries(fields).forEach(([k, v]) => fd.append(k, v));
+    const res = await fetch(`/api/studio/${session()}/update/${id}`, {method: "POST", body: fd});
+    const j = await res.json(); if (!res.ok) { alert(j.error); return; } info = j; render();
+  }
   $("#takes").addEventListener("click", async e => {
     const p = e.target.dataset.play, d = e.target.dataset.del;
+    const st = e.target.dataset.star, ed = e.target.dataset.edit, sv = e.target.dataset.save;
+    if (st) { const t = info.takes.find(x => x.id === st); updateTake(st, {active: t.active === false ? "1" : "0"}); }
+    if (ed) { const pn = document.querySelector(`[data-panel="${ed}"]`); pn.hidden = !pn.hidden; }
+    if (sv) {
+      const pn = document.querySelector(`[data-panel="${sv}"]`), f = {};
+      pn.querySelectorAll("input").forEach(i => f[i.name] = i.value); updateTake(sv, f);
+    }
     if (p) playTake(p);
     if (d && confirm("Delete this take?")) { info = await (await fetch(`/api/studio/${session()}/delete/${d}`, {method: "POST"})).json(); render(); }
   });
@@ -873,7 +980,7 @@ const Studio = (() => {
   return {session, refresh};
 })();
 
-document.querySelectorAll("label.file input").forEach(inp => inp.addEventListener("change", () => {
+document.querySelectorAll("label.file input:not(#studiobeat)").forEach(inp => inp.addEventListener("change", () => {
   const lab = inp.closest("label"), s = lab.querySelector(".s");
   const names = [...inp.files].map(f => f.name);
   lab.classList.toggle("has", names.length > 0);

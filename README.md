@@ -133,7 +133,13 @@ In the app, choose **🎙️ Record**:
    beat before it), tap **REC**, perform, tap **STOP**. Each take is saved as uncompressed
    audio the moment you stop, with a warning if it clipped or is too quiet. ▶ plays it back
    against the beat; 🗑 deletes it.
-4. Tap **Mix & master**: your takes are laid on the beat's timeline and go through auto-tune,
+   - **Loop record** a hook: set *start* and *end*, switch on **Loop**, and keep going. Each pass
+     is saved as its own take. The last complete pass is used; tap **★** on a better one and
+     the other passes step aside.
+   - **✎ Edit** any take: waveform, trim start/end, nudge ±150 ms, volume ±12 dB.
+   - Background noise (fans, AC, hiss, hum) is removed automatically in the mix. The strength
+     adapts to how noisy the take is, so a clean take isn't touched.
+4. Tap **Mix & master**: your ★ takes are laid on the beat's timeline and go through auto-tune,
    harmonies, doubles, the mix and the verified master.
 
 The recorder captures the raw mic: the phone's call processing (echo cancellation, noise
