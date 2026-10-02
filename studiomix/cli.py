@@ -6,13 +6,15 @@ import argparse
 import sys
 
 from . import __version__
-from .presets import PRESETS, TUNE_STYLES, get_preset
+from .presets import DELIVERY_PROFILES, PRESETS, TUNE_STYLES, get_preset
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="studiomix",
-        usage="studiomix VOCAL INSTRUMENTAL [options]\n       studiomix serve [--host HOST] [--port PORT]   (phone/browser app)",
+        usage="studiomix VOCAL INSTRUMENTAL [options]\n"
+              "       studiomix master MIX [options]                (master a finished/rough mix)\n"
+              "       studiomix serve [--host HOST] [--port PORT]   (phone/browser app)",
         description="Mix a vocal over an instrumental and master it for Spotify, Apple Music, YouTube & co.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="presets:\n" + "\n".join(f"  {p.name:10s} {p.description}" for p in PRESETS.values()),
@@ -46,6 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "and blue notes are left alone (e.g. 35; default off)")
     t.add_argument("--key-changes", action="store_true",
                    help="detect a key per song section (for songs that modulate) instead of one key")
+
+    ap.add_argument("--deliver", metavar="VERSIONS",
+                    help="extra verified versions: " + ", ".join(f"{k} ({v[1]} LUFS)" for k, v in DELIVERY_PROFILES.items()))
 
     st = ap.add_argument_group("vocal stack (built from the tuned lead)")
     st.add_argument("--doubles", action="store_const", const=True, default=None,
@@ -108,12 +113,78 @@ def check_harmonies(text: str | None) -> None:
             raise ValueError(f"unknown harmony '{iv.strip()}'. choose from: {', '.join(HARMONY_STEPS)}")
 
 
+def parse_deliver(text: str | None) -> list[str]:
+    out = [v.strip().lower() for v in (text or "").split(",") if v.strip()]
+    for v in out:
+        if v not in DELIVERY_PROFILES:
+            raise ValueError(f"unknown delivery version '{v}'. choose from: {', '.join(DELIVERY_PROFILES)}")
+    return out
+
+
+def _print_summary(log: dict, out: str) -> None:
+    o = log["output"]
+    print(f"\ndone in {log['processing_seconds']}s -> {out}/")
+    key = log.get("key", {}).get("key")
+    print(f"  {o['integrated_lufs']} LUFS | {o['true_peak_dbtp']} dBTP | LRA {o['loudness_range_lu']} LU"
+          + (f" | key {key}" if key else ""))
+    for f_ in log.get("diagnosis", {}).get("findings", []):
+        print(f"  * {f_}")
+    for c in log["delivery_check"]:
+        print(f"  [{'PASS' if c['ok'] else 'WARN'}] {c['check']}: {c['detail']}")
+    for v in log["files"].values():
+        print(f"  {v}")
+
+
+def master_main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="studiomix master",
+        description="Turn a finished or rough stereo mix into verified, release-ready masters. "
+                    "(Auto-tune needs separate vocal files - use the main command for that.)",
+        epilog="presets:\n" + "\n".join(f"  {p.name:10s} {p.description}" for p in PRESETS.values()),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("mix", help="your stereo mix (wav best; mp3/m4a with ffmpeg)")
+    ap.add_argument("-o", "--out", default="out")
+    ap.add_argument("-p", "--preset", default="pop", choices=list(PRESETS))
+    ap.add_argument("-n", "--name")
+    ap.add_argument("-r", "--reference", help="a released song to match the tone of")
+    ap.add_argument("--vocal-lift", type=float, default=0.0, metavar="DB",
+                    help="bring the (centre) vocal forward by DB, e.g. 2")
+    ap.add_argument("--lufs", dest="target_lufs", type=float)
+    ap.add_argument("--ceiling", dest="ceiling_dbtp", type=float)
+    ap.add_argument("--width", dest="master_width", type=float)
+    ap.add_argument("--deliver", metavar="VERSIONS",
+                    help="extra verified versions: " + ", ".join(DELIVERY_PROFILES))
+    ap.add_argument("-q", "--quiet", action="store_true")
+    a = ap.parse_args(argv)
+    from pathlib import Path
+
+    from .engine import master_mix
+
+    try:
+        extra = parse_deliver(a.deliver)
+        for f_ in [a.mix] + ([a.reference] if a.reference else []):
+            if not Path(f_).is_file():
+                raise FileNotFoundError(f"file not found: {f_}")
+        preset = get_preset(a.preset, **{k: v for k, v in vars(a).items() if v is not None})
+        log = master_mix(a.mix, a.out, preset, name=a.name, reference_path=a.reference,
+                         vocal_lift_db=a.vocal_lift, ceiling_overridden=a.ceiling_dbtp is not None,
+                         deliver_extra=extra, verbose=not a.quiet)
+    except (FileNotFoundError, ValueError, RuntimeError, KeyError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    _print_summary(log, a.out)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "serve":
         from .web import serve_main
 
         return serve_main(argv[1:])
+    if argv and argv[0] == "master":
+        return master_main(argv[1:])
     args = build_parser().parse_args(argv)
     overrides = {}
     if args.tune:
@@ -140,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             pitch.parse_key(args.key)
         check_harmonies(args.harmonies)
         stack_at = parse_time_ranges(args.stack_at)
+        extra = parse_deliver(args.deliver)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -152,18 +224,11 @@ def main(argv: list[str] | None = None) -> int:
             name=args.name, reference_path=args.reference, vocal_offset_ms=args.offset_ms,
             ceiling_overridden=args.ceiling_dbtp is not None, export_stems=not args.no_stems,
             verbose=not args.quiet, adlib_paths=args.adlibs, key=args.key,
-            key_changes=args.key_changes, stack_at=stack_at,
+            key_changes=args.key_changes, stack_at=stack_at, deliver_extra=extra,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    o = log["output"]
-    print(f"\ndone in {log['processing_seconds']}s -> {args.out}/")
-    print(f"  {o['integrated_lufs']} LUFS | {o['true_peak_dbtp']} dBTP | LRA {o['loudness_range_lu']} LU"
-          f" | key {log.get('key', {}).get('key', 'tuning off')}")
-    for c in log["delivery_check"]:
-        print(f"  [{'PASS' if c['ok'] else 'WARN'}] {c['check']}: {c['detail']}")
-    for v in log["files"].values():
-        print(f"  {v}")
+    _print_summary(log, args.out)
     return 0

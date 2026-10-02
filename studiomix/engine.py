@@ -11,7 +11,7 @@ import numpy as np
 
 from . import audio_io, chains
 from .dsp import analysis, effects, pitch
-from .presets import Preset, adlib_preset
+from .presets import DELIVERY_PROFILES, Preset, adlib_preset
 
 EPS = 1e-12
 TAIL_S = 3.0  # room for reverb / delay tails after the last note
@@ -49,6 +49,7 @@ def run(
     key_changes: bool = False,
     stack_at: list[tuple[float, float]] | None = None,
     progress=None,
+    deliver_extra: list[str] | None = None,
 ) -> dict:
     t0 = time.time()
 
@@ -187,7 +188,72 @@ def run(
     # ---------------------------------------------------------------- master
     say("master: tonal balance, multiband + glue compression, stereo image")
     pre = chains.master_chain(mix, sr, preset, log["master"], reference)
+    stems = []
+    if export_stems:
+        stems = [("vocal_stem", lead_bus), ("instrumental_stem", inst)]
+        if ad_dry:
+            stems.insert(1, ("adlib_stem", adlib_bus))
+        if stack is not None:
+            stems.insert(1, ("stack_stem", stack_bus))
+    return deliver(pre, mix, sr, preset, name, out_dir, log, say, t0, ceiling_overridden, stems, deliver_extra)
 
+
+def master_mix(
+    mix_path: str | Path,
+    out_dir: str | Path,
+    preset: Preset,
+    name: str | None = None,
+    reference_path: str | Path | None = None,
+    vocal_lift_db: float = 0.0,
+    ceiling_overridden: bool = False,
+    deliver_extra: list[str] | None = None,
+    verbose: bool = True,
+    progress=None,
+) -> dict:
+    """Finished or rough stereo mix -> diagnosed, repaired, mastered and verified release files."""
+    t0 = time.time()
+
+    def say(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+        _say(verbose, msg)
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = name or Path(mix_path).stem
+    log: dict = {"mode": "mastering a finished mix", "preset": preset.name, "mix_repair": {}, "master": {}}
+
+    say("loading the mix")
+    x, sr0 = audio_io.load(mix_path)
+    sr = audio_io.working_rate(sr0)
+    x = effects.to_stereo(audio_io.resample(x, sr0, sr))
+    log["sample_rate"] = sr
+    log["input"] = {"mix": {"file": str(mix_path), "sr": sr0, "channels": x.shape[0], **analysis.measure(x, sr)}}
+    reference = None
+    if reference_path:
+        r, sr_r = audio_io.load(reference_path)
+        reference = effects.to_stereo(audio_io.resample(r, sr_r, sr))
+        log["input"]["reference"] = {"file": str(reference_path), **analysis.measure(reference, sr)}
+
+    say("diagnosing the mix (clipping, phase, tone, headroom)")
+    diag = chains.diagnose_mix(x, sr, mix_path)
+    log["diagnosis"] = diag
+
+    say("repairing: DC/rumble, centre de-essing, anti-harshness" + (", vocal lift" if vocal_lift_db else ""))
+    x = chains.repair_mix(x, sr, preset, diag, vocal_lift_db, log["mix_repair"])
+    x = np.pad(x, ((0, 0), (0, int(1.0 * sr))))  # room for the fade-out
+    x *= 10 ** ((-6.0 - analysis.sample_peak_db(x)) / 20)  # premaster level: peaks at -6 dBFS
+
+    say("master: tonal balance, multiband + glue compression, stereo image")
+    pre = chains.master_chain(x, sr, preset, log["master"], reference)
+    return deliver(pre, x, sr, preset, name, out_dir, log, say, t0, ceiling_overridden, None, deliver_extra)
+
+
+def deliver(pre: np.ndarray, premaster: np.ndarray, sr: int, preset: Preset, name: str, out_dir: Path, log: dict,
+            say, t0: float, ceiling_overridden: bool = False, stems: list | None = None,
+            extra: list[str] | None = None) -> dict:
+    """Loudness + limiting, every export, extra delivery versions, and verification of the files
+    as written. Shared by the vocal+beat pipeline and the finished-mix mastering pipeline."""
     ceiling = preset.ceiling_dbtp
     if preset.target_lufs > -14.0 and not ceiling_overridden and ceiling > -2.0:
         # Spotify: masters louder than -14 LUFS should peak below -2 dBTP to survive lossy encoding
@@ -225,25 +291,32 @@ def run(
         files["mp3_preview"] = pmp3.name
 
     ppre = out_dir / f"{name}_premaster_mix_24bit.wav"
-    audio_io.write_wav(ppre, mix[:, :final_len], sr, 24)
+    audio_io.write_wav(ppre, premaster[:, :final_len], sr, 24)
     files["premaster_mix"] = ppre.name
 
-    if export_stems:
-        stems = [("vocal_stem", lead_bus), ("instrumental_stem", inst)]
-        if ad_dry:
-            stems.insert(1, ("adlib_stem", adlib_bus))
-        if stack is not None:
-            stems.insert(1, ("stack_stem", stack_bus))
-        for stem_name, stem in stems:
-            pth = out_dir / f"{name}_{stem_name}_24bit.wav"
-            audio_io.write_wav(pth, stem[:, :final_len], sr, 24)
-            files[stem_name] = pth.name
+    for stem_name, stem in stems or []:
+        pth = out_dir / f"{name}_{stem_name}_24bit.wav"
+        audio_io.write_wav(pth, stem[:, :final_len], sr, 24)
+        files[stem_name] = pth.name
+
+    # ---------------------------------------------------------------- extra delivery versions
+    versions = {}
+    for prof in extra or []:
+        label, lufs, tp_max, tol = DELIVERY_PROFILES[prof]
+        say(f"delivery version: {label} ({lufs} LUFS, <= {tp_max} dBTP)")
+        # gentle: no clipper, slower release - broadcast versions keep the dynamics
+        y = chains.finalize_loudness(pre, sr, lufs, tp_max, 0.0, max(preset.limiter_release_ms, 120.0), {})
+        y = chains.fade_edges(y, sr)
+        pth = out_dir / f"{name}_{prof}_{abs(lufs):g}LUFS_24bit_{sr / 1000:g}k.wav"
+        audio_io.write_wav(pth, y, sr, 24)
+        files[f"version_{prof}"] = pth.name
+        versions[prof] = (label, lufs, tp_max, tol)
 
     # ---------------------------------------------------------------- report
     say("verifying the delivered files (our meter + ffmpeg EBU R128)")
     final = analysis.measure(master, sr)
     deliverables = {}
-    for key_ in ("master_24bit", "master_16bit_cd", "mp3_preview"):
+    for key_ in ["master_24bit", "master_16bit_cd", "mp3_preview"] + [f"version_{p_}" for p_ in versions]:
         if key_ in files:
             pth = out_dir / files[key_]
             dec, dsr = audio_io.load(pth)  # what is actually on disk: dither, rate, encoding
@@ -253,10 +326,21 @@ def run(
     log["deliverables"] = deliverables
     log["files"] = files
     log["settings"] = asdict(preset)
-    log["delivery_check"] = delivery_check(final, ceiling, preset.target_lufs, deliverables)
+    main = {k: v for k, v in deliverables.items() if not k.startswith("version_")}
+    checks = delivery_check(final, ceiling, preset.target_lufs, main)
+    for prof, (label, lufs, tp_max, tol) in versions.items():
+        d = deliverables[f"version_{prof}"]
+        o_, f_ = d["ours"], d.get("ffmpeg") or {}
+        tp = max(o_["true_peak_dbtp"], f_.get("true_peak_dbtp", -99.0) - 0.05)
+        li = [o_["integrated_lufs"]] + ([f_["integrated_lufs"]] if "integrated_lufs" in f_ else [])
+        ok = all(abs(v - lufs) <= tol for v in li) and tp <= tp_max + 0.005
+        checks.insert(3, {"check": f"{label} version", "ok": ok,
+                          "detail": f"{o_['integrated_lufs']:.2f} LUFS (spec {lufs} +-{tol}), {o_['true_peak_dbtp']:.2f} dBTP "
+                                    f"(max {tp_max}), LRA {o_['loudness_range_lu']} LU"})
+    log["delivery_check"] = checks
     log["processing_seconds"] = round(time.time() - t0, 1)
 
-    (out_dir / f"{name}_report.json").write_text(json.dumps(log, indent=2))
+    (out_dir / f"{name}_report.json").write_text(json.dumps(log, indent=2, default=float))
     (out_dir / f"{name}_report.txt").write_text(format_report(name, log))
     return log
 
@@ -309,13 +393,15 @@ def delivery_check(m: dict, ceiling: float, target: float | None = None,
 
 
 def format_report(name: str, log: dict) -> str:
-    o, i = log["output"], log["input"]
+    o = log["output"]
+    head = f"Preset: {log['preset']}    Sample rate: {log['sample_rate']} Hz"
+    if "instrumental" in log:
+        head += (f"    Tempo: {log['instrumental'].get('tempo_bpm') or 'n/a'} BPM    "
+                 f"Key: {log.get('key', {}).get('key', 'tuning off')}")
     lines = [
-        f"STUDIOMIX MASTER REPORT - {name}",
+        f"STUDIOMIX MASTER REPORT - {name}" + (f"  ({log['mode']})" if log.get("mode") else ""),
         "=" * 60,
-        f"Preset: {log['preset']}    Sample rate: {log['sample_rate']} Hz    "
-        f"Tempo: {log['instrumental'].get('tempo_bpm') or 'n/a'} BPM    "
-        f"Key: {log.get('key', {}).get('key', 'tuning off')}",
+        head,
         "",
         "FINAL MASTER",
         f"  Integrated loudness : {o['integrated_lufs']} LUFS   (target {log['master']['target_lufs']})",
@@ -326,14 +412,16 @@ def format_report(name: str, log: dict) -> str:
         f"  Duration            : {o['duration_s']} s",
         "",
         "INPUTS",
-        f"  Vocal        : {i['vocal']['integrated_lufs']} LUFS, peak {i['vocal']['true_peak_dbtp']} dBTP",
-        f"  Instrumental : {i['instrumental']['integrated_lufs']} LUFS, peak {i['instrumental']['true_peak_dbtp']} dBTP",
-        "",
-        "WHAT WAS DONE",
     ]
-    sections = [("vocal", log["vocal"])] + ([("stack", log["stack"])] if log.get("stack") else [])
-    sections += [(f"ad-lib {i + 1}", a) for i, a in enumerate(log["adlibs"])]
-    sections += [("instrumental", log["instrumental"]), ("master", log["master"])]
+    for k, v in log["input"].items():
+        lines.append(f"  {k:12s} : {v['integrated_lufs']} LUFS, peak {v['true_peak_dbtp']} dBTP")
+    if log.get("diagnosis"):
+        lines += ["", "MIX DIAGNOSIS"] + [f"  - {f_}" for f_ in log["diagnosis"]["findings"]]
+    lines += ["", "WHAT WAS DONE"]
+    sections = [(k, log[k]) for k in ("mix_repair", "vocal") if log.get(k)]
+    sections += [("stack", log["stack"])] if log.get("stack") else []
+    sections += [(f"ad-lib {i + 1}", a_) for i, a_ in enumerate(log.get("adlibs", []))]
+    sections += [(k, log[k]) for k in ("instrumental", "master") if k in log]
     for section, entries in sections:
         for k, v in entries.items():
             lines.append(f"  {section:12s} {k:24s} {v}")
@@ -354,5 +442,6 @@ def format_report(name: str, log: dict) -> str:
     lines += ["", "FILES"]
     for k, v in log["files"].items():
         lines.append(f"  {k:20s} {v}")
-    lines += ["", "Upload the 24-bit WAV (or 16-bit if your distributor requires it) - never the MP3.", ""]
+    lines += ["", "Upload the 24-bit WAV (or 16-bit if your distributor requires it) - never the MP3.",
+              "Broadcast versions (EBU R128 / ATSC A/85) are for radio/TV stations that ask for them.", ""]
     return "\n".join(lines)

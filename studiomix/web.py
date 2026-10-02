@@ -70,7 +70,7 @@ def _parse_multipart(content_type: str, body: bytes):
 def _run_job(job: dict) -> None:
     from .cli import check_harmonies, parse_time_ranges
     from .dsp import pitch
-    from .engine import run
+    from .engine import master_mix, run
 
     def progress(msg: str) -> None:
         with _jobs_lock:
@@ -82,18 +82,26 @@ def _run_job(job: dict) -> None:
             job["started"] = time.time()
         try:
             o = job["options"]
-            if o.get("key"):
-                pitch.parse_key(o["key"])
-            check_harmonies(o.get("harmonies"))
-            log = run(
-                job["lead"], job["beat"], job["out"], job["preset"], name=job["name"],
-                adlib_paths=job["adlibs"], key=o.get("key") or None, key_changes=o.get("key_changes", False),
-                stack_at=parse_time_ranges(o.get("stack_at")), verbose=False, progress=progress,
-            )
+            if job["mode"] == "mix":
+                log = master_mix(job["mix"], job["out"], job["preset"], name=job["name"],
+                                 reference_path=job.get("reference"), vocal_lift_db=o.get("vocal_lift", 0.0),
+                                 deliver_extra=o.get("deliver"), verbose=False, progress=progress)
+            else:
+                if o.get("key"):
+                    pitch.parse_key(o["key"])
+                check_harmonies(o.get("harmonies"))
+                log = run(
+                    job["lead"], job["beat"], job["out"], job["preset"], name=job["name"],
+                    adlib_paths=job["adlibs"], key=o.get("key") or None, key_changes=o.get("key_changes", False),
+                    stack_at=parse_time_ranges(o.get("stack_at")), verbose=False, progress=progress,
+                    deliver_extra=o.get("deliver"),
+                )
             with _jobs_lock:
                 job["status"] = "done"
                 job["result"] = {
-                    "output": log["output"], "key": log.get("key", {}).get("key", "tuning off"),
+                    "output": log["output"],
+                    "key": log.get("key", {}).get("key", "—" if job["mode"] == "mix" else "tuning off"),
+                    "findings": log.get("diagnosis", {}).get("findings", []),
                     "checks": log["delivery_check"], "files": log["files"],
                     "seconds": log["processing_seconds"],
                 }
@@ -164,8 +172,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "expected a form upload"})
         fields, files = _parse_multipart(ctype, self.rfile.read(length))
         f = lambda k, d="": (fields.get(k) or [d])[0].strip()  # noqa: E731
-        if not files.get("lead") or not files.get("beat"):
+        mode = "mix" if f("mode") == "mix" else "stems"
+        if mode == "mix" and not files.get("mix"):
+            return self._json(400, {"error": "choose your mix file"})
+        if mode == "stems" and (not files.get("lead") or not files.get("beat")):
             return self._json(400, {"error": "a lead vocal and a beat are required"})
+        from .cli import parse_deliver
+
+        try:
+            deliver = parse_deliver(",".join(fields.get("deliver", [])))
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
 
         preset_name = f("preset", "pop")
         if preset_name not in PRESETS:
@@ -192,7 +209,8 @@ class Handler(BaseHTTPRequestHandler):
         preset = get_preset(preset_name, **overrides)
 
         job_id = uuid.uuid4().hex[:12]
-        name = re.sub(r"[^A-Za-z0-9._ -]+", "_", f("name") or Path(files["lead"][0][0]).stem)[:60] or "song"
+        first = files["mix" if mode == "mix" else "lead"][0][0]
+        name = re.sub(r"[^A-Za-z0-9._ -]+", "_", f("name") or Path(first).stem)[:60] or "song"
         out = self.jobs_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{name}"
         src = out / "inputs"
         src.mkdir(parents=True, exist_ok=True)
@@ -203,13 +221,20 @@ class Handler(BaseHTTPRequestHandler):
             return p
 
         job = {
-            "id": job_id, "status": "queued", "log": [], "name": name, "out": out, "preset": preset,
-            "lead": save(files["lead"][0], "lead"), "beat": save(files["beat"][0], "beat"),
-            "adlibs": [save(it, f"adlib{i + 1}") for i, it in enumerate(files.get("adlibs", []))],
+            "id": job_id, "status": "queued", "log": [], "name": name, "out": out, "preset": preset, "mode": mode,
             "options": {"key": f("key"), "key_changes": f("key_changes") == "on", "harmonies": harmonies,
-                        "stack_at": f("stack_at")},
+                        "stack_at": f("stack_at"), "deliver": deliver,
+                        "vocal_lift": 2.0 if f("vocal_lift") == "on" else 0.0},
             "started": time.time(),
         }
+        if mode == "mix":
+            job["mix"] = save(files["mix"][0], "mix")
+            if files.get("reference"):
+                job["reference"] = save(files["reference"][0], "reference")
+        else:
+            job["lead"] = save(files["lead"][0], "lead")
+            job["beat"] = save(files["beat"][0], "beat")
+            job["adlibs"] = [save(it, f"adlib{i + 1}") for i, it in enumerate(files.get("adlibs", []))]
         with _jobs_lock:
             _jobs[job_id] = job
         threading.Thread(target=_run_job, args=(job,), daemon=True).start()
@@ -330,6 +355,12 @@ audio { width: 100%; margin: 4px 0 12px; }
   margin-bottom: 8px; color: var(--text); text-decoration: none; }
 .dl a span { color: var(--muted); font-size: 13px; }
 .err { color: #ff6b6b; font-weight: 600; }
+.modes { grid-template-columns: 1fr 1fr; margin-bottom: 14px; }
+.modes label { padding: 12px 0; font-size: 15px; }
+body.mode-mix .only-stems { display: none; }
+body:not(.mode-mix) .only-mix { display: none; }
+#diag { margin: 0 0 12px; padding-left: 18px; font-size: 14px; }
+#diag li { margin: 4px 0; }
 .muted { color: var(--muted); font-size: 13px; }
 </style>
 </head>
@@ -338,7 +369,23 @@ audio { width: 100%; margin: 4px 0 12px; }
 <header><h1>studio<span>mix</span></h1><div class="ver">v{{VERSION}}</div></header>
 
 <form id="f">
-<section>
+<div class="seg modes">
+  <input type="radio" name="mode" id="m1" value="stems" checked><label for="m1">🎤 Vocal + beat</label>
+  <input type="radio" name="mode" id="m2" value="mix"><label for="m2">🎚️ Finished mix</label>
+</div>
+
+<section class="only-mix">
+  <h2>Your mix</h2>
+  <label class="file"><input type="file" name="mix" accept="audio/*,.wav,.mp3,.flac,.m4a">
+    <div class="icon">🎚️</div><div><div class="t">Rough / finished mix</div><div class="s">Tap to choose · one stereo file, WAV best</div></div></label>
+  <label class="file"><input type="file" name="reference" accept="audio/*,.wav,.mp3,.flac,.m4a">
+    <div class="icon">⭐</div><div><div class="t">Reference song <span class="muted">(optional)</span></div><div class="s">A released track whose sound you want</div></div></label>
+  <div class="row"><div><div class="lbl">Bring vocals forward</div><div class="hint">+2 dB presence on the centre (lead vocal)</div></div>
+    <label class="switch"><input type="checkbox" name="vocal_lift"><span></span></label></div>
+  <p class="muted" style="margin:6px 2px 0">It checks for clipping, phase, mud, harshness and silence, fixes what it can, then masters. Auto-tune needs the separate vocal (use "Vocal + beat").</p>
+</section>
+
+<section class="only-stems">
   <h2>Tracks</h2>
   <label class="file" data-for="lead"><input type="file" name="lead" accept="audio/*,.wav,.mp3,.flac,.m4a" required>
     <div class="icon">🎤</div><div><div class="t">Lead vocal</div><div class="s">Tap to choose · dry, no effects</div></div></label>
@@ -352,22 +399,22 @@ audio { width: 100%; margin: 4px 0 12px; }
 <section>
   <h2>Sound</h2>
   <div class="row"><div class="stack"><div class="lbl">Style</div><select name="preset">{{PRESETS}}</select></div></div>
-  <div class="row"><div class="stack"><div class="lbl">Auto-tune</div>
+  <div class="row only-stems"><div class="stack"><div class="lbl">Auto-tune</div>
     <div class="seg">
       <input type="radio" name="tune" id="t0" value="off"><label for="t0">Off</label>
       <input type="radio" name="tune" id="t1" value="natural"><label for="t1">Natural</label>
       <input type="radio" name="tune" id="t2" value="" checked><label for="t2">Style</label>
       <input type="radio" name="tune" id="t3" value="hard"><label for="t3">Hard</label>
     </div><div class="hint">"Style" uses the preset's own setting · Hard = instant robotic snap</div></div></div>
-  <div class="row"><div class="stack"><div class="lbl">Key</div>
+  <div class="row only-stems"><div class="stack"><div class="lbl">Key</div>
     <input type="text" name="key" placeholder="Auto-detect (or e.g. F# minor)" autocomplete="off"></div></div>
-  <div class="row"><div><div class="lbl">Song changes key</div><div class="hint">Detect a key per section</div></div>
+  <div class="row only-stems"><div><div class="lbl">Song changes key</div><div class="hint">Detect a key per section</div></div>
     <label class="switch"><input type="checkbox" name="key_changes"><span></span></label></div>
-  <div class="row"><div><div class="lbl">Flex-Tune</div><div class="hint">Keep intentional bends & runs natural</div></div>
+  <div class="row only-stems"><div><div class="lbl">Flex-Tune</div><div class="hint">Keep intentional bends & runs natural</div></div>
     <label class="switch"><input type="checkbox" id="flexon"><span></span></label></div>
 </section>
 
-<section>
+<section class="only-stems">
   <h2>Vocal stack</h2>
   <div class="row"><div><div class="lbl">Doubles</div><div class="hint">Two thick double-tracks, wide</div></div>
     <label class="switch"><input type="checkbox" name="doubles"><span></span></label></div>
@@ -385,10 +432,20 @@ audio { width: 100%; margin: 4px 0 12px; }
 </section>
 
 <section>
+  <h2>Extra versions</h2>
+  <div class="chips">
+    <input type="checkbox" name="deliver" value="ebu-r128" id="d1"><label for="d1">Radio/TV EU · -23 LUFS</label>
+    <input type="checkbox" name="deliver" value="atsc-a85" id="d2"><label for="d2">Radio/TV US · -24 LKFS</label>
+    <input type="checkbox" name="deliver" value="apple" id="d3"><label for="d3">Apple Music · -16 LUFS</label>
+  </div>
+  <p class="muted" style="margin:10px 2px 0">Your main master is always made. These are extra files for stations or platforms that ask for them, each checked against its spec.</p>
+</section>
+
+<section>
   <details><summary>More options</summary>
     <div class="row"><div class="stack"><div class="lbl">Song name</div><input type="text" name="name" placeholder="From the vocal file name"></div></div>
     <div class="row"><div class="stack"><div class="lbl">Loudness (LUFS)</div><input type="number" name="lufs" step="0.5" placeholder="Preset default (e.g. -9 trap, -14 streaming)"></div></div>
-    <div class="row"><div class="stack"><div class="lbl">Vocal level vs beat (dB)</div><input type="number" name="vocal_level" step="0.5" placeholder="Preset default"></div></div>
+    <div class="row only-stems"><div class="stack"><div class="lbl">Vocal level vs beat (dB)</div><input type="number" name="vocal_level" step="0.5" placeholder="Preset default"></div></div>
   </details>
 </section>
 </form>
@@ -402,6 +459,7 @@ audio { width: 100%; margin: 4px 0 12px; }
 
 <section id="result">
   <h2>Done</h2>
+  <ul id="diag"></ul>
   <div class="big"><div><b id="rl"></b><span>LUFS</span></div><div><b id="rt"></b><span>dBTP peak</span></div><div><b id="rk"></b><span>key</span></div></div>
   <audio id="player" controls preload="metadata"></audio>
   <ul class="checks" id="checks"></ul>
@@ -418,7 +476,20 @@ const LABELS = {master_24bit: ["Master · 24-bit WAV", "upload this to your dist
   mp3_preview: ["Preview · MP3 320k", "for sharing, not for stores"],
   premaster_mix: ["Mix before mastering", "for a mastering engineer"],
   vocal_stem: ["Lead vocal stem", ""], stack_stem: ["Doubles + harmonies stem", ""],
-  adlib_stem: ["Ad-lib stem", ""], instrumental_stem: ["Beat stem", ""]};
+  adlib_stem: ["Ad-lib stem", ""], instrumental_stem: ["Beat stem", ""],
+  "version_ebu-r128": ["Radio/TV EU · EBU R128", "-23 LUFS, -1 dBTP max"],
+  "version_atsc-a85": ["Radio/TV US · ATSC A/85", "-24 LKFS, -2 dBTP max"],
+  "version_apple": ["Apple Music level", "-16 LUFS, -1 dBTP max"],
+  "version_streaming": ["Streaming level", "-14 LUFS, -1 dBTP max"]};
+function setMode() {
+  const mix = document.querySelector("input[name=mode]:checked").value === "mix";
+  document.body.classList.toggle("mode-mix", mix);
+  document.querySelector("input[name=mix]").required = mix;
+  document.querySelector("input[name=lead]").required = !mix;
+  document.querySelector("input[name=beat]").required = !mix;
+}
+document.querySelectorAll("input[name=mode]").forEach(r => r.addEventListener("change", setMode));
+setMode();
 const STEPS_EST = 9;
 
 document.querySelectorAll("label.file input").forEach(inp => inp.addEventListener("change", () => {
@@ -472,6 +543,8 @@ async function poll(id) {
 
 function show(id, j) {
   const r = j.result, o = r.output;
+  const dg = $("#diag"); dg.innerHTML = "";
+  (r.findings || []).forEach(t => { const li = document.createElement("li"); li.textContent = t; dg.appendChild(li); });
   $("#rl").textContent = o.integrated_lufs; $("#rt").textContent = o.true_peak_dbtp; $("#rk").textContent = r.key;
   const url = f => "/jobs/" + id + "/" + encodeURIComponent(f);
   $("#player").src = url(r.files.mp3_preview || r.files.master_16bit_cd);

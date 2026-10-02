@@ -20,6 +20,50 @@ out/
   My Song_report.txt / .json          <- loudness, peaks, what was done, delivery checks
 ```
 
+## Already have a mix? Master it
+
+```bash
+studiomix master rough_mix.wav -p hiphop --vocal-lift 2 --deliver ebu-r128,apple
+```
+
+Use this for a finished or rough stereo bounce, with vocals and beat already together. It
+works like a mastering engineer:
+
+1. **Diagnose** the mix and report the problems in plain words:
+   - clipped bounce
+   - lossy source file
+   - DC offset
+   - **out-of-phase bass** (it would vanish on phones)
+   - boomy, muddy, harsh or dull tone
+   - dead air at the start
+2. **Repair:**
+   - remove DC and rumble
+   - recover out-of-phase bass and make it mono
+   - de-ess and tame harshness **on the centre channel only** (where the lead vocal sits), so the
+     beat's stereo content isn't touched
+   - optional `--vocal-lift` to bring the vocal forward
+   - trim dead air
+3. **Master and verify,** exactly like the full pipeline. `--reference song.wav` matches the
+   tone of a released track.
+
+Auto-tune, de-essing a single vocal, and vocal-to-beat balance need the separate vocal file, so
+use the main command for those. Pulling the vocal out of a finished mix takes an AI separation
+model, which is too heavy to run on a phone.
+
+## Broadcast and platform versions
+
+`--deliver` (on both commands, and as chips in the app) renders extra 24-bit versions from the
+same master. Each one is checked against its spec with both meters:
+
+| version    | for                                   | loudness       | true peak |
+|------------|---------------------------------------|----------------|-----------|
+| `ebu-r128` | EU radio / TV broadcast               | -23 LUFS ±0.5  | ≤ -1 dBTP |
+| `atsc-a85` | US radio / TV broadcast               | -24 LKFS ±2    | ≤ -2 dBTP |
+| `apple`    | Apple Music Sound Check level         | -16 LUFS ±0.5  | ≤ -1 dBTP |
+| `streaming`| Spotify / YouTube reference level     | -14 LUFS ±0.5  | ≤ -1 dBTP |
+
+Broadcast versions skip the clipper and use a slower limiter release, so they keep their dynamics.
+
 ## Install
 
 Requires Python 3.10+. The only dependencies are numpy, scipy and pyloudnorm.

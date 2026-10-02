@@ -126,6 +126,14 @@ PRESETS: dict[str, Preset] = {
 }
 
 
+# Extra delivery versions rendered from the same pre-limiter master. (label, LUFS, max dBTP, tolerance LU)
+DELIVERY_PROFILES = {
+    "ebu-r128": ("EBU R128 broadcast (EU TV/radio)", -23.0, -1.0, 0.5),
+    "atsc-a85": ("ATSC A/85 broadcast (US TV/radio)", -24.0, -2.0, 2.0),
+    "apple": ("Apple Music Sound Check level", -16.0, -1.0, 0.5),
+    "streaming": ("Spotify/YouTube reference level", -14.0, -1.0, 0.5),
+}
+
 TUNE_STYLES = {
     # name: (retune_ms, humanize, amount)
     "off": (0.0, 0.0, 0.0),

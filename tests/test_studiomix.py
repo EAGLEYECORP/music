@@ -439,3 +439,60 @@ def test_loudness_lands_exactly_on_target():
         got = analysis.integrated_lufs(y, 48000)
         assert target - 0.03 <= got <= target + 1e-6
         assert dynamics.true_peak_db(y) <= ceiling
+
+
+# ------------------------------------------------------------------ finished-mix mastering + broadcast versions
+
+
+@pytest.fixture(scope="module")
+def rough_mix(demo_files, tmp_path_factory):
+    """A deliberately bad bounce: clipped, DC offset, out-of-phase bass, 2.5 s of dead air."""
+    from scipy import signal as _sig
+
+    sr = 48000
+    v, _ = audio_io.load(demo_files / "v.wav")
+    b, sb = audio_io.load(demo_files / "b.wav")
+    b = audio_io.resample(b, sb, sr)
+    n = min(v.shape[1], b.shape[1])
+    mix = b[:, :n] * 0.9 + np.vstack([v[0, :n], v[0, :n]]) * 0.6
+    lo = _sig.sosfiltfilt(_sig.butter(4, 120, fs=sr, output="sos"), mix[1])
+    mix[1] = mix[1] - 2 * lo
+    mix = np.clip(mix / np.max(np.abs(mix)) * 2.5, -1, 1) + 0.004  # flat-topped, like a real clipped bounce
+    mix = np.concatenate([np.zeros((2, int(2.5 * sr))), mix], axis=1)
+    p = tmp_path_factory.mktemp("rough") / "rough.wav"
+    audio_io.write_wav(p, mix, sr, 16)
+    return p
+
+
+def test_diagnosis_finds_planted_problems(rough_mix):
+    x, sr = audio_io.load(rough_mix)
+    d = chains.diagnose_mix(x, sr)
+    text = " ".join(d["findings"])
+    assert d["metrics"]["clipped_spots"] > 0
+    assert "DC offset" in text and "out of phase" in text and "silence" in text
+
+
+def test_master_finished_mix_with_broadcast_versions(rough_mix, tmp_path):
+    from studiomix.engine import master_mix
+
+    log = master_mix(rough_mix, tmp_path, get_preset("hiphop"), name="m", vocal_lift_db=2.0,
+                     deliver_extra=["ebu-r128", "atsc-a85", "apple"], verbose=False)
+    assert all(c["ok"] for c in log["delivery_check"] if not c["check"].startswith("Dynamics"))
+    assert log["mix_repair"]["low_end_phase_fix"]
+    for key, lufs, tp in (("version_ebu-r128", -23.0, -1.0), ("version_atsc-a85", -24.0, -2.0),
+                          ("version_apple", -16.0, -1.0)):
+        x, sr = audio_io.load(tmp_path / log["files"][key])
+        assert analysis.integrated_lufs(x, sr) == pytest.approx(lufs, abs=0.1)
+        assert dynamics.true_peak_db(x) <= tp
+    # the master starts right away (dead air trimmed) and the bass survived the phase fix
+    m, sr = audio_io.load(tmp_path / log["files"]["master_24bit"])
+    assert np.argmax(np.max(np.abs(m), axis=0) > 1e-3) / sr < 0.5
+    lo = np.mean(filters.lowpass(m, sr, 120.0, order=4), axis=0)
+    assert 10 * np.log10(np.mean(lo ** 2)) > -30
+
+
+def test_cli_master_and_deliver_validation(rough_mix, tmp_path, capsys):
+    from studiomix.cli import main
+
+    assert main(["master", str(rough_mix), "-o", str(tmp_path), "--deliver", "nope", "-q"]) == 1
+    assert "unknown delivery version" in capsys.readouterr().err

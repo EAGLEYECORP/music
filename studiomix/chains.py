@@ -253,6 +253,111 @@ def instrumental_chain(inst: np.ndarray, vocal_dry: np.ndarray, sr: int, active:
     return inst
 
 
+# ------------------------------------------------------------------ finished / rough mix
+
+def diagnose_mix(x: np.ndarray, sr: int, src_path=None) -> dict:
+    """What a mastering engineer checks first. Returns {'findings': [...], 'metrics': {...}}."""
+    findings: list[str] = []
+    mono = np.mean(x, axis=0)
+    peak = np.max(np.abs(x))
+    # clipping: runs of 3+ consecutive samples at (almost) the same full-scale value
+    hot = np.abs(x) >= 0.999 * peak
+    runs = 0
+    if peak > 0.98:
+        for ch in hot:
+            d = np.diff(np.concatenate([[0], ch.astype(np.int8), [0]]))
+            runs += int(np.sum((np.flatnonzero(d == -1) - np.flatnonzero(d == 1)) >= 3))
+    if runs:
+        findings.append(f"the bounce is clipped in {runs} places - re-export the mix ~3-6 dB quieter if you can "
+                        "(clipping can't be fully undone; the master will hide it as well as possible)")
+    if src_path is not None and str(src_path).lower().endswith((".mp3", ".m4a", ".aac", ".ogg", ".opus")):
+        findings.append("the mix is a lossy file (mp3/aac): a WAV export of the mix will master cleaner")
+    dc = float(np.max(np.abs(np.mean(x, axis=1))))
+    if dc > 1e-3:
+        findings.append(f"DC offset ({20 * np.log10(dc):.0f} dBFS) - removed")
+    corr = analysis.stereo_correlation(x)
+    lo = filters.lowpass(x, sr, 150.0, order=4)
+    lo_corr = analysis.stereo_correlation(lo)
+    if lo_corr < 0.5:
+        findings.append(f"low end is partly out of phase between left and right (correlation {lo_corr:.2f}) - "
+                        "bass would vanish on phones/mono - the bass is recovered and made mono")
+    if corr < 0.2:
+        findings.append(f"very wide / phasey mix (correlation {corr:.2f}) - check it in mono")
+    # tonal balance against the commercial tilt, in four broad regions
+    f, db = filters.ltas_db(mono, sr)
+    db = filters.fractional_octave_smooth(f, db, 1.0)
+    rel = db - filters.slope_target(f, -4.5)
+    ref = np.median(rel[(f > 200) & (f < 5000)])
+
+    def band(lo_, hi_):
+        return float(np.mean(rel[(f >= lo_) & (f < hi_)]) - ref)
+
+    tone = {"sub_lows_40_120": band(40, 120), "mud_200_500": band(200, 500),
+            "harsh_2k_5k": band(2000, 5000), "air_8k_14k": band(8000, 14000)}
+    if tone["sub_lows_40_120"] > 5:
+        findings.append("low end is heavy/boomy - tamed by the tonal balance and the low-band compressor")
+    elif tone["sub_lows_40_120"] < -5:
+        findings.append("low end is thin - gently lifted")
+    if tone["mud_200_500"] > 3:
+        findings.append("muddy low-mids (200-500 Hz) - cleaned up")
+    if tone["harsh_2k_5k"] > 3:
+        findings.append("harsh upper-mids (2-5 kHz) - dynamic anti-harshness applied")
+    if tone["air_8k_14k"] < -6:
+        findings.append("dull top end - air added")
+    head = np.argmax(np.max(np.abs(x), axis=0) > 10 ** (-60 / 20)) / sr
+    if head > 1.0:
+        findings.append(f"{head:.1f} s of silence before the music starts - trimmed to 0.2 s")
+    lufs = analysis.integrated_lufs(x, sr)
+    if not findings:
+        findings.append("clean mix - no problems found; mastering only")
+    return {"findings": findings, "metrics": {
+        "integrated_lufs": round(lufs, 2), "sample_peak_dbfs": round(20 * np.log10(peak + EPS), 2),
+        "stereo_correlation": round(corr, 3), "low_end_correlation": round(lo_corr, 3), "clipped_spots": runs,
+        "tone_vs_commercial_db": {k: round(v, 1) for k, v in tone.items()}, "lead_in_silence_s": round(float(head), 2),
+    }}
+
+
+def repair_mix(x: np.ndarray, sr: int, p: Preset, diag: dict, vocal_lift_db: float, log: dict) -> np.ndarray:
+    """Mix-level fixes before mastering. Vocal work happens on the Mid (centre) channel, where the
+    lead vocal of a hip-hop/pop mix sits - the beat's stereo content is left alone."""
+    x = x - np.mean(x, axis=1, keepdims=True)  # DC
+    x = filters.highpass(x, sr, 25.0, order=4)  # subsonic rumble
+    lead_in = diag["metrics"]["lead_in_silence_s"]
+    if lead_in > 1.0:
+        x = x[:, int((lead_in - 0.2) * sr):]
+    mid = 0.5 * (x[0] + x[1])
+    side = 0.5 * (x[0] - x[1])
+    if diag["metrics"]["low_end_correlation"] < 0.0:
+        # out-of-phase bass lives in the SIDE signal; folding the lows to mono (as the master
+        # does) would delete it. Recover it: the low band of whichever of mid/side carries more
+        # bass becomes the mono low end.
+        mid_lo, mid_hi = filters.lr4_split(mid[None, :], sr, 150.0)
+        side_lo, side_hi = filters.lr4_split(side[None, :], sr, 150.0)
+        if np.mean(side_lo ** 2) > np.mean(mid_lo ** 2):
+            mid = (side_lo + mid_hi)[0]
+            side = side_hi[0]
+            log["low_end_phase_fix"] = "recovered out-of-phase bass from the side channel"
+    m = mid[None, :]
+    active, _ = analysis.activity_mask(m, sr)
+    # sibilance and harshness live on the vocal, i.e. in the centre
+    m, gr_s = dynamics.deess(m, sr, active, max_reduction_db=4.0, sensitivity_db=4.0)
+    band = filters.bandpass(m, sr, 2000.0, 5000.0, order=2)
+    det = dynamics.detector_db(band, sr, "rms", 5.0)
+    thr = float(np.percentile(det[active], 80)) if active.any() else float(np.percentile(det, 80))
+    gr_h = dynamics.compressor_gain(det, sr, thr, 3.0, 6.0, 3.0, 80.0, 3.0)
+    m = m + (10 ** (gr_h / 20) - 1.0)[None, :] * band
+    log["centre_deess_max_db"] = round(float(np.min(gr_s)), 2)
+    log["anti_harsh_max_db"] = round(float(np.min(gr_h)), 2)
+    if vocal_lift_db:
+        # presence + intelligibility in the centre only: brings the lead forward without
+        # touching the beat's wide elements
+        m = filters.eq(m, sr, "peak", 2800.0, vocal_lift_db, 0.8)
+        m = filters.eq(m, sr, "peak", 250.0, -0.5 * vocal_lift_db, 1.0)
+        log["vocal_lift_db"] = vocal_lift_db
+    mid = m[0]
+    return np.vstack([mid + side, mid - side])
+
+
 # ------------------------------------------------------------------ master
 
 def master_chain(mix: np.ndarray, sr: int, p: Preset, log: dict, reference: np.ndarray | None = None) -> np.ndarray:
