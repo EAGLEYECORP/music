@@ -27,6 +27,17 @@ class Preset:
     vocal_rider_db: float = 3.0         # max vocal-rider correction vs. the beat
     vocal_balance_db: float = 0.5       # vocal loudness relative to instrumental (LU)
 
+    # ---- pitch correction (applied to lead and ad-libs)
+    tune_amount: float = 1.0            # 0 = off, 1 = full correction
+    tune_retune_ms: float = 25.0        # 0 = instant/robotic (T-Pain), 20-40 = modern pop, 80+ = natural
+    tune_humanize: float = 0.35         # how much vibrato / expression survives on held notes (0-1)
+
+    # ---- ad-libs
+    adlib_level_db: float = -5.0        # ad-lib loudness relative to the lead (LU)
+    adlib_pan: float = 0.5              # phrases alternate between this far left / right (0 = centre)
+    adlib_reverb: float = 0.18
+    adlib_delay: float = 0.14
+
     # ---- instrumental
     inst_hpf_hz: float = 25.0
     inst_carve_db: float = 3.0          # max dip in the 1.5-5 kHz band while the vocal sings
@@ -51,6 +62,7 @@ PRESETS: dict[str, Preset] = {
             name="pop",
             description="Bright, upfront vocal; polished and competitive (-11 LUFS).",
             vocal_presence_db=2.5, vocal_air_db=3.5, vocal_balance_db=1.0,
+            tune_retune_ms=30.0, tune_humanize=0.4,
             target_lufs=-11.0, ceiling_dbtp=-1.0,
         ),
         Preset(
@@ -59,8 +71,19 @@ PRESETS: dict[str, Preset] = {
             vocal_hpf_hz=100.0, vocal_comp_amount=1.3, vocal_saturation=0.25,
             vocal_reverb=0.06, vocal_reverb_size=0.4, vocal_delay=0.08, vocal_delay_note=0.125,
             vocal_balance_db=1.5, inst_carve_db=3.5, master_tilt_db_oct=-5.0,
+            tune_retune_ms=10.0, tune_humanize=0.15, adlib_level_db=-4.0, adlib_pan=0.55,
             master_bass_mono_hz=150.0, master_width=1.05, master_clip_knee_db=2.5,
             target_lufs=-9.0, limiter_release_ms=60.0,
+        ),
+        Preset(
+            name="trap",
+            description="Trap / melodic rap: hard robotic auto-tune, loud, wide ad-libs (-8.5 LUFS).",
+            vocal_hpf_hz=110.0, vocal_comp_amount=1.4, vocal_saturation=0.25, vocal_air_db=4.0,
+            vocal_reverb=0.08, vocal_reverb_size=0.5, vocal_delay=0.1, vocal_delay_note=0.125,
+            vocal_balance_db=1.0, inst_carve_db=3.5, master_tilt_db_oct=-5.0,
+            tune_retune_ms=0.0, tune_humanize=0.0, adlib_level_db=-3.5, adlib_pan=0.7, adlib_delay=0.18,
+            master_bass_mono_hz=150.0, master_width=1.1, master_clip_knee_db=3.0,
+            target_lufs=-8.5, limiter_release_ms=50.0,
         ),
         Preset(
             name="rnb",
@@ -68,6 +91,7 @@ PRESETS: dict[str, Preset] = {
             vocal_presence_db=1.5, vocal_air_db=3.0, vocal_saturation=0.2,
             vocal_reverb=0.18, vocal_reverb_size=0.7, vocal_delay=0.08,
             vocal_balance_db=0.5, master_width=1.15, target_lufs=-11.0,
+            tune_retune_ms=30.0, tune_humanize=0.5, adlib_level_db=-6.0, adlib_reverb=0.24,
         ),
         Preset(
             name="rock",
@@ -75,6 +99,7 @@ PRESETS: dict[str, Preset] = {
             vocal_hpf_hz=100.0, vocal_presence_db=3.0, vocal_comp_amount=1.2, vocal_saturation=0.25,
             vocal_reverb=0.1, vocal_balance_db=-0.5, inst_carve_db=4.0,
             master_tilt_db_oct=-4.0, target_lufs=-10.0,
+            tune_amount=0.8, tune_retune_ms=70.0, tune_humanize=0.8,
         ),
         Preset(
             name="acoustic",
@@ -83,6 +108,7 @@ PRESETS: dict[str, Preset] = {
             vocal_reverb=0.16, vocal_reverb_size=0.65, vocal_delay=0.03,
             vocal_balance_db=1.0, inst_carve_db=2.0, master_mb_amount=0.6, master_glue_ratio=1.5,
             master_clip_knee_db=0.0, target_lufs=-14.0, limiter_release_ms=120.0,
+            tune_amount=0.7, tune_retune_ms=90.0, tune_humanize=0.85,
         ),
         Preset(
             name="streaming",
@@ -91,6 +117,29 @@ PRESETS: dict[str, Preset] = {
         ),
     ]
 }
+
+
+TUNE_STYLES = {
+    # name: (retune_ms, humanize, amount)
+    "off": (0.0, 0.0, 0.0),
+    "natural": (80.0, 0.8, 0.8),
+    "pop": (25.0, 0.4, 1.0),
+    "hard": (0.0, 0.0, 1.0),
+}
+
+
+def adlib_preset(p: Preset) -> Preset:
+    """Ad-libs: thinner, more compressed and more effected than the lead."""
+    return replace(
+        p,
+        vocal_hpf_hz=max(p.vocal_hpf_hz, 150.0),
+        vocal_mud_cut_db=p.vocal_mud_cut_db - 1.5,
+        vocal_presence_db=p.vocal_presence_db + 1.0,
+        vocal_comp_amount=p.vocal_comp_amount * 1.3,
+        vocal_saturation=min(0.5, p.vocal_saturation + 0.1),
+        vocal_reverb=p.adlib_reverb,
+        vocal_delay=p.adlib_delay,
+    )
 
 
 def get_preset(preset_name: str, **overrides) -> Preset:

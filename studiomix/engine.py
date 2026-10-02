@@ -10,8 +10,8 @@ from pathlib import Path
 import numpy as np
 
 from . import audio_io, chains
-from .dsp import analysis, effects
-from .presets import Preset
+from .dsp import analysis, effects, pitch
+from .presets import Preset, adlib_preset
 
 EPS = 1e-12
 TAIL_S = 3.0  # room for reverb / delay tails after the last note
@@ -44,28 +44,35 @@ def run(
     ceiling_overridden: bool = False,
     export_stems: bool = True,
     verbose: bool = True,
+    adlib_paths: list[str | Path] | None = None,
+    key: str | None = None,
 ) -> dict:
     t0 = time.time()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     name = name or Path(vocal_path).stem
-    log: dict = {"preset": preset.name, "vocal": {}, "instrumental": {}, "master": {}}
+    adlib_paths = list(adlib_paths or [])
+    log: dict = {"preset": preset.name, "vocal": {}, "adlibs": [], "instrumental": {}, "master": {}}
 
     # ---------------------------------------------------------------- load
     _say(verbose, "loading audio")
     v, sr_v = audio_io.load(vocal_path)
     b, sr_b = audio_io.load(inst_path)
-    sr = audio_io.working_rate(sr_v, sr_b)
+    adl = [audio_io.load(pth) for pth in adlib_paths]
+    sr = audio_io.working_rate(sr_v, sr_b, *[s_ for _, s_ in adl])
     v = audio_io.resample(v, sr_v, sr)
     b = audio_io.resample(b, sr_b, sr)
+    adl = [audio_io.resample(x, s_, sr) for x, s_ in adl]
     log["sample_rate"] = sr
     log["input"] = {
         "vocal": {"file": str(vocal_path), "sr": sr_v, "channels": v.shape[0], **analysis.measure(effects.to_stereo(v), sr)},
         "instrumental": {"file": str(inst_path), "sr": sr_b, "channels": b.shape[0], **analysis.measure(effects.to_stereo(b), sr)},
     }
-    length = max(v.shape[-1] + int(vocal_offset_ms * sr / 1000), b.shape[-1]) + int(TAIL_S * sr)
-    v = _align(v, length, int(vocal_offset_ms * sr / 1000))
+    off = int(vocal_offset_ms * sr / 1000)
+    length = max([v.shape[-1] + off, b.shape[-1]] + [x.shape[-1] + off for x in adl]) + int(TAIL_S * sr)
+    v = _align(v, length, off)
     b = _align(b, length)
+    adl = [_align(x, length, off) for x in adl]
 
     reference = None
     if reference_path:
@@ -73,31 +80,71 @@ def run(
         reference = effects.to_stereo(audio_io.resample(r, sr_r, sr))
         log["input"]["reference"] = {"file": str(reference_path), **analysis.measure(reference, sr)}
 
-    # ---------------------------------------------------------------- vocal
-    _say(verbose, "vocal: cleanup, auto-EQ, compression, de-essing, saturation")
-    vocal, active = chains.vocal_chain(v, sr, preset, log["vocal"])
+    # ---------------------------------------------------------------- key
+    tune_key, trk = None, None
+    if preset.tune_amount > 0:
+        if key:
+            tune_key = pitch.parse_key(key)
+            log["key"] = {"key": pitch.key_name(*tune_key), "source": "user"}
+        else:
+            _say(verbose, "detecting the song key (beat chroma + vocal melody)")
+            trk = pitch.track(np.mean(v, axis=0), sr)
+            tonic, mode, conf = pitch.detect_key(pitch.chroma(b, sr), pitch.pitch_class_histogram(trk["midi"]))
+            if conf >= 0.5:
+                tune_key = (tonic, mode)
+                log["key"] = {"key": pitch.key_name(tonic, mode), "source": "detected", "confidence": round(conf, 2)}
+            else:
+                # not sure about the key: snapping to the nearest semitone is always safe
+                tune_key = (0, "chromatic")
+                log["key"] = {"key": "chromatic", "source": "fallback", "confidence": round(conf, 2),
+                              "best_guess": pitch.key_name(tonic, mode),
+                              "note": "key detection unsure - pass --key for scale-aware tuning"}
+        _say(verbose, f"key: {log['key']['key']}")
+
+    # ---------------------------------------------------------------- vocals
+    _say(verbose, "lead vocal: cleanup, auto-tune, auto-EQ, compression, de-essing, saturation")
+    vocal, active = chains.vocal_chain(v, sr, preset, log["vocal"], tune_key, "vocal", trk)
+
+    ad_dry = []
+    ap = adlib_preset(preset)
+    for i, (x, pth) in enumerate(zip(adl, adlib_paths)):
+        _say(verbose, f"ad-libs {i + 1}/{len(adl)}: same chain, thinner + more compressed, panned per phrase")
+        alog: dict = {"file": str(pth)}
+        dry, act = chains.vocal_chain(x, sr, ap, alog, tune_key, "ad-lib")
+        dry = chains.pan_phrases(dry, sr, act, preset.adlib_pan, start_left=(i % 2 == 0))
+        ad_dry.append(dry)
+        log["adlibs"].append(alog)
 
     # ---------------------------------------------------------------- instrumental
     _say(verbose, "instrumental: subsonic filter, vocal-keyed presence carve")
-    inst = chains.instrumental_chain(b, vocal, sr, active, preset, log["instrumental"])
+    key_sig = vocal if not ad_dry else effects.to_stereo(vocal) + 0.5 * sum(ad_dry)
+    inst = chains.instrumental_chain(b, key_sig, sr, active, preset, log["instrumental"])
     inst = inst * 10 ** ((-18.0 - analysis.integrated_lufs(inst, sr)) / 20)  # common gain staging
 
     # ---------------------------------------------------------------- balance + ride
-    _say(verbose, "balancing vocal against the beat + automatic vocal riding")
+    _say(verbose, "balancing vocals against the beat + automatic vocal riding")
     vocal = chains.vocal_rider(vocal, inst, sr, active, preset.vocal_rider_db, log["vocal"])
     tempo = analysis.estimate_tempo(inst, sr)
     log["instrumental"]["tempo_bpm"] = round(tempo, 1) if tempo else None
-    vocal_bus = chains.vocal_effects(vocal, sr, preset, tempo, log["vocal"])
-    v_lufs = analysis.integrated_lufs(vocal_bus, sr)
+    lead_bus = chains.vocal_effects(vocal, sr, preset, tempo, log["vocal"])
     i_lufs = analysis.integrated_lufs(inst, sr)
-    vgain = (i_lufs + preset.vocal_balance_db) - v_lufs
-    vocal_bus = vocal_bus * 10 ** (vgain / 20)
+    lead_target = i_lufs + preset.vocal_balance_db
+    lead_bus = lead_bus * 10 ** ((lead_target - analysis.integrated_lufs(lead_bus, sr)) / 20)
     log["vocal"]["balance_lu_vs_inst"] = preset.vocal_balance_db
+
+    adlib_bus = np.zeros_like(lead_bus)
+    for dry, alog in zip(ad_dry, log["adlibs"]):
+        bus = chains.vocal_effects(dry, sr, ap, tempo, alog)
+        adlib_bus += bus * 10 ** ((lead_target + preset.adlib_level_db - analysis.integrated_lufs(bus, sr)) / 20)
+        alog["level_lu_vs_lead"] = preset.adlib_level_db
+    vocal_bus = lead_bus + adlib_bus
 
     mix = inst + vocal_bus
     headroom = -6.0 - analysis.sample_peak_db(mix)  # classic premaster: peaks at -6 dBFS
     mix *= 10 ** (headroom / 20)
     vocal_bus *= 10 ** (headroom / 20)
+    lead_bus *= 10 ** (headroom / 20)
+    adlib_bus *= 10 ** (headroom / 20)
     inst *= 10 ** (headroom / 20)
 
     # ---------------------------------------------------------------- master
@@ -129,7 +176,8 @@ def run(
     else:
         # limit the 44.1 kHz delivery natively: resampling a limited master re-creates overs
         m44 = chains.finalize_loudness(audio_io.resample(pre, sr, 44100), 44100, preset.target_lufs, ceiling,
-                                       preset.master_clip_knee_db, preset.limiter_release_ms, {})
+                                       preset.master_clip_knee_db, preset.limiter_release_ms, {},
+                                       start_gain_db=log["master"]["drive_db"])
         m44 = chains.fade_edges(m44, 44100)
     p16 = out_dir / f"{name}_master_16bit_44.1k.wav"
     audio_io.write_wav16_dithered(p16, m44, 44100)
@@ -144,10 +192,13 @@ def run(
     files["premaster_mix"] = ppre.name
 
     if export_stems:
-        for key, stem in (("vocal_stem", vocal_bus), ("instrumental_stem", inst)):
-            pth = out_dir / f"{name}_{key}_24bit.wav"
+        stems = [("vocal_stem", lead_bus), ("instrumental_stem", inst)]
+        if ad_dry:
+            stems.insert(1, ("adlib_stem", adlib_bus))
+        for stem_name, stem in stems:
+            pth = out_dir / f"{name}_{stem_name}_24bit.wav"
             audio_io.write_wav(pth, stem[:, :final_len], sr, 24)
-            files[key] = pth.name
+            files[stem_name] = pth.name
 
     # ---------------------------------------------------------------- report
     final = analysis.measure(master, sr)
@@ -189,7 +240,8 @@ def format_report(name: str, log: dict) -> str:
         f"STUDIOMIX MASTER REPORT - {name}",
         "=" * 60,
         f"Preset: {log['preset']}    Sample rate: {log['sample_rate']} Hz    "
-        f"Tempo: {log['instrumental'].get('tempo_bpm') or 'n/a'} BPM",
+        f"Tempo: {log['instrumental'].get('tempo_bpm') or 'n/a'} BPM    "
+        f"Key: {log.get('key', {}).get('key', 'tuning off')}",
         "",
         "FINAL MASTER",
         f"  Integrated loudness : {o['integrated_lufs']} LUFS   (target {log['master']['target_lufs']})",
@@ -205,9 +257,13 @@ def format_report(name: str, log: dict) -> str:
         "",
         "WHAT WAS DONE",
     ]
-    for section in ("vocal", "instrumental", "master"):
-        for k, v in log[section].items():
+    sections = [("vocal", log["vocal"])] + [(f"ad-lib {i + 1}", a) for i, a in enumerate(log["adlibs"])]
+    sections += [("instrumental", log["instrumental"]), ("master", log["master"])]
+    for section, entries in sections:
+        for k, v in entries.items():
             lines.append(f"  {section:12s} {k:24s} {v}")
+    if log.get("key", {}).get("note"):
+        lines.append(f"  NOTE: {log['key']['note']}")
     lines += ["", "DELIVERY CHECKS"]
     for c in log["delivery_check"]:
         lines.append(f"  [{'PASS' if c['ok'] else 'WARN'}] {c['check']}: {c['detail']}")

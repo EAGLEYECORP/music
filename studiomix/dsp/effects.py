@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
-import pedalboard
 from scipy import signal
+from scipy.ndimage import uniform_filter1d
 
 from .filters import highpass, lowpass, lr4_split
 
@@ -15,18 +15,43 @@ def to_stereo(x: np.ndarray) -> np.ndarray:
     return x[:2]
 
 
+def reverb_ir(sr: int, decay_s: float, damping: float = 0.5, width: float = 1.0, seed: int = 7) -> np.ndarray:
+    """Synthesise a stereo plate/hall impulse response: sparse early reflections into a dense
+    exponentially decaying tail whose highs die faster than its lows (air/surface absorption)."""
+    rng = np.random.default_rng(seed)
+    n = int(sr * min(decay_s * 1.1, 6.0))
+    t = np.arange(n) / sr
+    ir = np.zeros((2, n))
+    # three bands with their own RT60
+    bands = [("lowpass", 500.0, 1.15), ("bandpass", (500.0, 4000.0), 1.0), ("highpass", 4000.0, 1.0 - 0.65 * damping)]
+    for kind, f, rt_scale in bands:
+        noise = rng.standard_normal((2, n))
+        sos = signal.butter(2, f, kind, fs=sr, output="sos")
+        env = 10.0 ** (-3.0 * t / max(decay_s * rt_scale, 0.05))
+        ir += signal.sosfilt(sos, noise, axis=-1) * env
+    # diffuse tail builds up over the first ~20 ms
+    ir *= np.minimum(1.0, t / 0.02)[None, :]
+    # early reflections, alternating sides
+    ref = np.sqrt(np.mean(ir[:, : int(sr * 0.1)] ** 2))
+    for k in range(10):
+        i = int(sr * rng.uniform(0.004, 0.06))
+        ir[k % 2, i] += 5.0 * ref * (1 - k / 12) * rng.choice([-1, 1])
+    mid = 0.5 * (ir[0] + ir[1])
+    side = 0.5 * (ir[0] - ir[1]) * width
+    ir = np.vstack([mid + side, mid - side])
+    return ir / np.sqrt(np.sum(ir ** 2) / 2)  # unit energy per channel: wet ~ dry level
+
+
 def reverb(x: np.ndarray, sr: int, room_size: float = 0.55, damping: float = 0.5, width: float = 1.0,
            predelay_ms: float = 30.0, hp_hz: float = 350.0, lp_hz: float = 7500.0) -> np.ndarray:
     """100% wet stereo reverb return with pre-delay and return EQ (like an aux send)."""
-    src = to_stereo(x).astype(np.float32)
+    decay = 0.5 + 2.6 * float(np.clip(room_size, 0.0, 1.0))
+    ir = reverb_ir(sr, decay, damping, width)
     pad = int(sr * predelay_ms / 1000)
-    tail = int(sr * 4.0)
-    src = np.pad(src, ((0, 0), (pad, tail)))
-    board = pedalboard.Pedalboard([
-        pedalboard.Reverb(room_size=room_size, damping=damping, wet_level=1.0, dry_level=0.0, width=width),
-    ])
-    wet = board(src, sr).astype(np.float64)[:, : x.shape[-1]]
-    wet = highpass(wet, sr, hp_hz, order=2)
+    src = np.mean(x, axis=0)
+    src = highpass(src[None, :], sr, hp_hz, order=2)[0]
+    wet = np.vstack([signal.oaconvolve(src, ir[c])[: len(src)] for c in range(2)])
+    wet = np.pad(wet, ((0, 0), (pad, 0)))[:, : x.shape[-1]]
     return lowpass(wet, sr, lp_hz, order=2)
 
 
@@ -62,6 +87,21 @@ def saturate(x: np.ndarray, drive_db: float = 6.0, mix: float = 0.2) -> np.ndarr
     rms_x = np.sqrt(np.mean(x * x)) + 1e-12
     rms_s = np.sqrt(np.mean(sat * sat)) + 1e-12
     return (1 - mix) * x + mix * sat * (rms_x / rms_s)
+
+
+def pan_curve(n: int, sr: int, segments: list[tuple[int, int, float]], smooth_ms: float = 30.0) -> np.ndarray:
+    """Per-sample pan position (-1 = left, +1 = right) from (start, end, pan) segments."""
+    pan = np.zeros(n)
+    for a, b, p in segments:
+        pan[a:b] = p
+    return uniform_filter1d(pan, max(1, int(sr * smooth_ms / 1000)), mode="nearest")
+
+
+def apply_pan(mono: np.ndarray, pan: np.ndarray | float) -> np.ndarray:
+    """Constant-power panning of a mono signal; centre gives unity gain on both sides."""
+    theta = (np.asarray(pan) + 1.0) * np.pi / 4.0
+    g = np.sqrt(2.0)
+    return np.vstack([mono * g * np.cos(theta), mono * g * np.sin(theta)])
 
 
 def stereo_image(x: np.ndarray, sr: int, mono_below_hz: float = 120.0, high_width: float = 1.1,

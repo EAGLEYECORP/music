@@ -3,7 +3,8 @@
     python tools/make_demo.py demo/
 
 The 'vocal' is a formant-synthesised singer with deliberately amateur problems: uneven phrase
-levels, harsh sibilants, low-frequency rumble and room noise. The beat is a simple 92 BPM loop.
+levels, harsh sibilants, low-frequency rumble and room noise. The beat is a simple 92 BPM loop in A minor.
+The singer is up to 45 cents out of tune.
 """
 
 from __future__ import annotations
@@ -12,8 +13,16 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 from scipy import signal
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from studiomix.audio_io import write_wav  # noqa: E402
+
+
+class sf:  # tiny shim so this script needs no soundfile
+    @staticmethod
+    def write(path, data, sr, subtype="PCM_24"):
+        write_wav(path, data.T, sr, 16 if subtype == "PCM_16" else 24)
 
 
 def beat(sr: int = 44100, seconds: float = 30.0, bpm: float = 92.0, seed: int = 1) -> np.ndarray:
@@ -64,22 +73,24 @@ def beat(sr: int = 44100, seconds: float = 30.0, bpm: float = 92.0, seed: int = 
     return out / np.max(np.abs(out)) * 0.7
 
 
-def vocal(sr: int = 48000, seconds: float = 30.0, seed: int = 2) -> np.ndarray:
+def vocal(sr: int = 48000, seconds: float = 30.0, seed: int = 2, adlib: bool = False) -> np.ndarray:
     rng = np.random.default_rng(seed)
     n = int(sr * seconds)
     out = np.zeros(n)
     formants = {"a": (800, 1150, 2900), "e": (400, 2000, 2600), "o": (450, 800, 2830), "i": (300, 2300, 3000)}
     notes = [220.0, 246.94, 261.63, 293.66, 329.63, 293.66, 261.63, 246.94]
     phrase_gain = [1.0, 0.35, 1.4, 0.6, 1.1, 0.45]  # very uneven performance
-    t = 1.5
+    t = 3.2 if adlib else 1.5
     k = 0
     while t < seconds - 4:
         g = phrase_gain[k % len(phrase_gain)]
-        for _ in range(6):
-            dur = rng.uniform(0.25, 0.6)
+        for _ in range(2 if adlib else 6):
+            dur = rng.uniform(0.15, 0.3) if adlib else rng.uniform(0.25, 0.6)
             m = int(dur * sr)
             tt = np.arange(m) / sr
-            f0 = notes[rng.integers(len(notes))] * (1 + 0.012 * np.sin(2 * np.pi * 5.5 * tt))
+            detune = 2 ** (rng.uniform(-0.45, 0.45) / 12)  # sloppy intonation: up to 45 cents off
+            base = notes[rng.integers(len(notes))] * (2.0 if adlib else 1.0)
+            f0 = base * detune * (1 + 0.012 * np.sin(2 * np.pi * 5.5 * tt))
             src = signal.sawtooth(2 * np.pi * np.cumsum(f0) / sr, 0.1)
             v = np.zeros(m)
             for f, bw in zip(formants["aeoi"[rng.integers(4)]], (80, 100, 140)):
@@ -97,7 +108,7 @@ def vocal(sr: int = 48000, seconds: float = 30.0, seed: int = 2) -> np.ndarray:
                 k_s = max(0, min(len(s), n - j))
                 out[j:j + k_s] += s[:k_s] * 0.25 * g
             t += dur + 0.12
-        t += 0.8
+        t += rng.uniform(1.5, 3.5) if adlib else 0.8
         k += 1
     rumble = signal.sosfilt(signal.butter(2, 60, "lowpass", fs=sr, output="sos"), rng.standard_normal(n)) * 0.05
     hiss = rng.standard_normal(n) * 0.0015
@@ -109,8 +120,9 @@ def main() -> None:
     d = Path(sys.argv[1] if len(sys.argv) > 1 else "demo")
     d.mkdir(parents=True, exist_ok=True)
     sf.write(d / "demo_vocal.wav", vocal().T, 48000, subtype="PCM_24")
+    sf.write(d / "demo_adlibs.wav", vocal(seed=5, adlib=True).T, 48000, subtype="PCM_24")
     sf.write(d / "demo_beat.wav", beat().T, 44100, subtype="PCM_16")
-    print(f"wrote {d}/demo_vocal.wav and {d}/demo_beat.wav")
+    print(f"wrote {d}/demo_vocal.wav, {d}/demo_adlibs.wav and {d}/demo_beat.wav")
 
 
 if __name__ == "__main__":

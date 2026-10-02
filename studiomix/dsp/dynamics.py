@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import numpy as np
-from numba import njit
 from scipy import signal
 from scipy.ndimage import minimum_filter1d, uniform_filter1d
 
+from ._jit import HAS_NUMBA, kernel
 from .filters import bandpass, highpass
 
 EPS = 1e-12
@@ -31,9 +31,9 @@ def detector_db(x: np.ndarray, sr: int, mode: str = "rms", window_ms: float = 5.
     return 20.0 * np.log10(np.max(np.abs(x), axis=0) + EPS)
 
 
-@njit(cache=True)
+@kernel
 def _compressor_gain(det_db, thr, ratio, knee, att, rel, max_gr):
-    n = det_db.shape[0]
+    n = len(det_db)
     out = np.empty(n)
     slope = 1.0 / ratio - 1.0
     g = 0.0
@@ -55,9 +55,9 @@ def _compressor_gain(det_db, thr, ratio, knee, att, rel, max_gr):
     return out
 
 
-@njit(cache=True)
+@kernel
 def _expander_gain(det_db, thr, ratio, range_db, att, rel):
-    n = det_db.shape[0]
+    n = len(det_db)
     out = np.empty(n)
     g = 0.0
     for i in range(n):
@@ -73,9 +73,9 @@ def _expander_gain(det_db, thr, ratio, range_db, att, rel):
     return out
 
 
-@njit(cache=True)
+@kernel
 def _release_follow(g_db, rel):
-    n = g_db.shape[0]
+    n = len(g_db)
     out = np.empty(n)
     g = 0.0
     for i in range(n):
@@ -86,6 +86,55 @@ def _release_follow(g_db, rel):
             g = rel * g + (1.0 - rel) * t
         out[i] = g
     return out
+
+
+# Without numba the kernels run in plain Python on a decimated control signal (one value per
+# CONTROL_BLOCK samples, ~0.3 ms at 48 kHz) and the resulting gain curve is interpolated back.
+CONTROL_BLOCK = 16
+
+
+def _blocks(x: np.ndarray, reduce):
+    n = len(x)
+    nb = -(-n // CONTROL_BLOCK)
+    pad = nb * CONTROL_BLOCK - n
+    xb = np.pad(x, (0, pad), mode="edge").reshape(nb, CONTROL_BLOCK)
+    return reduce(xb, axis=1)
+
+
+def _unblock(g: np.ndarray, n: int) -> np.ndarray:
+    centers = np.arange(len(g)) * CONTROL_BLOCK + (CONTROL_BLOCK - 1) / 2.0
+    return np.interp(np.arange(n), centers, g)
+
+
+def compressor_gain(det_db: np.ndarray, sr: int, thr: float, ratio: float, knee: float, attack_ms: float,
+                    release_ms: float, max_gr: float) -> np.ndarray:
+    """Gain reduction (dB, <= 0) for a detector signal."""
+    if HAS_NUMBA:
+        return _compressor_gain(det_db, float(thr), float(ratio), float(knee), coef(attack_ms, sr),
+                                coef(release_ms, sr), float(max_gr))
+    csr = sr / CONTROL_BLOCK
+    g = _compressor_gain(_blocks(det_db, np.max).tolist(), float(thr), float(ratio), float(knee),
+                         coef(attack_ms, csr), coef(release_ms, csr), float(max_gr))
+    return _unblock(g, len(det_db))
+
+
+def expander_gain(det_db: np.ndarray, sr: int, thr: float, ratio: float, range_db: float, attack_ms: float,
+                  release_ms: float) -> np.ndarray:
+    if HAS_NUMBA:
+        return _expander_gain(det_db, float(thr), float(ratio), float(range_db), coef(attack_ms, sr),
+                              coef(release_ms, sr))
+    csr = sr / CONTROL_BLOCK
+    g = _expander_gain(_blocks(det_db, np.max).tolist(), float(thr), float(ratio), float(range_db),
+                       coef(attack_ms, csr), coef(release_ms, csr))
+    return _unblock(g, len(det_db))
+
+
+def release_follow(g_db: np.ndarray, sr: int, release_ms: float) -> np.ndarray:
+    """Instant attack / smooth release on a gain curve; never exceeds the input gain."""
+    if HAS_NUMBA:
+        return _release_follow(g_db, coef(release_ms, sr))
+    g = _release_follow(_blocks(g_db, np.min).tolist(), coef(release_ms, sr / CONTROL_BLOCK))
+    return np.minimum(_unblock(g, len(g_db)), g_db)
 
 
 def compress(
@@ -105,8 +154,7 @@ def compress(
     """Feed-forward compressor. Returns (output, gain_reduction_db per sample)."""
     key = x if sidechain is None else sidechain
     det = detector_db(key, sr, detector, rms_ms)
-    gr = _compressor_gain(det, float(threshold_db), float(ratio), float(knee_db),
-                          coef(attack_ms, sr), coef(release_ms, sr), float(max_gr_db))
+    gr = compressor_gain(det, sr, threshold_db, ratio, knee_db, attack_ms, release_ms, max_gr_db)
     return x * db_to_lin(gr + makeup_db)[None, :], gr
 
 
@@ -114,8 +162,7 @@ def expand(x: np.ndarray, sr: int, threshold_db: float, ratio: float = 2.0, rang
            attack_ms: float = 2.0, release_ms: float = 120.0):
     """Downward expander (soft gate) for cleaning noise between phrases."""
     det = detector_db(x, sr, "rms", 10.0)
-    gr = _expander_gain(det, float(threshold_db), float(ratio), float(range_db),
-                        coef(attack_ms, sr), coef(release_ms, sr))
+    gr = expander_gain(det, sr, threshold_db, ratio, range_db, attack_ms, release_ms)
     return x * db_to_lin(gr)[None, :], gr
 
 
@@ -132,7 +179,7 @@ def deess(x: np.ndarray, sr: int, active: np.ndarray, split_hz: float = 4500.0, 
     det = detector_db(key, sr, "rms", 1.0)
     act = det[active] if active is not None and active.any() else det
     thr = float(np.percentile(act, 75)) + sensitivity_db
-    gr = _compressor_gain(det, thr, 5.0, 4.0, coef(0.5, sr), coef(60.0, sr), float(max_reduction_db))
+    gr = compressor_gain(det, sr, thr, 5.0, 4.0, 0.5, 60.0, max_reduction_db)
     return low + high * db_to_lin(gr)[None, :], gr
 
 
@@ -155,11 +202,14 @@ def soft_clip(x: np.ndarray, ceiling_db: float, knee_db: float = 3.0, oversample
     """Oversampled soft clipper: linear below (ceiling - knee), tanh-saturating up to ceiling."""
     t = 10.0 ** (ceiling_db / 20.0)
     k = t * 10.0 ** (-knee_db / 20.0)
+    if np.max(np.abs(x)) < k * 0.5:  # far below the knee even allowing for inter-sample peaks
+        return x
     up = signal.resample_poly(x, oversample, 1, axis=-1)
-    a = np.abs(up)
-    over = a > k
-    shaped = np.where(over, k + (t - k) * np.tanh((a - k) / (t - k)), a)
-    up = np.sign(up) * shaped
+    over = np.abs(up) > k
+    if not over.any():
+        return x
+    a = np.abs(up[over])
+    up[over] = np.sign(up[over]) * (k + (t - k) * np.tanh((a - k) / (t - k)))
     return signal.resample_poly(up, 1, oversample, axis=-1)[:, : x.shape[-1]]
 
 
@@ -176,7 +226,7 @@ def limit(x: np.ndarray, sr: int, ceiling_db: float = -1.0, lookahead_ms: float 
     # smooth attack ramp starting `a` samples before each peak.
     g = minimum_filter1d(req, width, mode="nearest")
     g = uniform_filter1d(g, width, mode="nearest")
-    g_db = _release_follow(20.0 * np.log10(np.maximum(g, EPS)), coef(release_ms, sr))
+    g_db = release_follow(20.0 * np.log10(np.maximum(g, EPS)), sr, release_ms)
     y = x * db_to_lin(g_db)[None, :]
     # safety net for residual inter-sample overs created by the gain modulation itself
     for _ in range(3):

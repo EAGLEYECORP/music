@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 from scipy import signal
 
-from .dsp import analysis, dynamics, effects, filters
+from .dsp import analysis, dynamics, effects, filters, pitch
 from .presets import Preset
 
 EPS = 1e-12
@@ -41,8 +41,9 @@ def _tonal_correction(x, sr, target_db_fn, strength, max_db, f_lo, f_hi, smooth_
 
 # ------------------------------------------------------------------ vocal
 
-def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Clean, tone and control the lead vocal. Returns (dry processed vocal, activity mask)."""
+def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict, key: tuple[int, str] | None = None,
+                label: str = "vocal", trk: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Clean, tune, tone and control a vocal. Returns (dry processed vocal, activity mask)."""
     # stereo vocal files are almost always a mono performance: fold to mono unless truly stereo
     if v.shape[0] >= 2:
         corr = analysis.stereo_correlation(v)
@@ -55,7 +56,7 @@ def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict) -> tuple[np.ndarra
     active, _ = analysis.activity_mask(v, sr)
     log["active_seconds"] = round(active.sum() / sr, 1)
     if active.sum() < sr * 0.5:
-        raise ValueError("the vocal file looks silent - check the file")
+        raise ValueError(f"the {label} file looks silent - check the file")
 
     # 1. normalise the performance to a fixed working level so every threshold below is meaningful
     v = _gain(v, -20.0 - _rms_db(v, active))
@@ -63,7 +64,14 @@ def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict) -> tuple[np.ndarra
     # 2. rumble / plosive / handling-noise removal
     v = filters.highpass(v, sr, p.vocal_hpf_hz, order=4)
 
-    # 3. soft gate (downward expander) for room noise between phrases
+    # 3. pitch correction, on the clean raw voice (before compression/saturation colour it)
+    if key is not None and p.tune_amount > 0:
+        v, stats = pitch.autotune(v, sr, key[0], key[1], p.tune_retune_ms, p.tune_humanize, p.tune_amount,
+                                   trk=trk)
+        log["autotune"] = {"key": pitch.key_name(*key), "retune_ms": p.tune_retune_ms,
+                           "humanize": p.tune_humanize, **stats}
+
+    # 3b. soft gate (downward expander) for room noise between phrases
     frames = analysis.frame_rms_db(v, sr, 50.0)
     floor = float(np.percentile(frames, 10))
     if floor < -45.0:
@@ -161,6 +169,23 @@ def vocal_effects(v: np.ndarray, sr: int, p: Preset, tempo: float | None, log: d
     return dry + wet
 
 
+def pan_phrases(v: np.ndarray, sr: int, active: np.ndarray, width: float, start_left: bool = True) -> np.ndarray:
+    """Pan each ad-lib phrase alternately left/right (the classic hip-hop ad-lib spread)."""
+    mono = np.mean(v, axis=0)
+    if width <= 0:
+        return np.vstack([mono, mono])
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], active.astype(np.int8), [0]])))
+    starts = list(edges[::2])
+    segments = []
+    side = -1.0 if start_left else 1.0
+    # each phrase holds its side until the next phrase starts (no swing back through centre in the tail)
+    for i, a in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(mono)
+        segments.append((0 if i == 0 else a, end, side * width))
+        side = -side
+    return effects.apply_pan(mono, effects.pan_curve(len(mono), sr, segments))
+
+
 # ------------------------------------------------------------------ instrumental
 
 def instrumental_chain(inst: np.ndarray, vocal_dry: np.ndarray, sr: int, active: np.ndarray, p: Preset,
@@ -173,8 +198,7 @@ def instrumental_chain(inst: np.ndarray, vocal_dry: np.ndarray, sr: int, active:
         key = filters.bandpass(vocal_dry, sr, 1000.0, 5000.0, order=2)
         det = dynamics.detector_db(key, sr, "rms", 10.0)
         thr = float(np.percentile(det[active], 10)) if active.any() else -40.0
-        gr = dynamics._compressor_gain(det, thr, 3.0, 6.0, dynamics.coef(10.0, sr), dynamics.coef(180.0, sr),
-                                       float(p.inst_carve_db))
+        gr = dynamics.compressor_gain(det, sr, thr, 3.0, 6.0, 10.0, 180.0, p.inst_carve_db)
         g = 10.0 ** (gr / 20.0)
         inst = inst + (g - 1.0)[None, :] * band
         log["carve_avg_db"] = round(float(np.mean(gr[active])) if active.any() else 0.0, 2)
@@ -231,19 +255,35 @@ def master_chain(mix: np.ndarray, sr: int, p: Preset, log: dict, reference: np.n
 
 
 def finalize_loudness(x: np.ndarray, sr: int, target_lufs: float, ceiling_dbtp: float, clip_knee_db: float,
-                      release_ms: float, log: dict) -> np.ndarray:
-    """Drive into soft clipper + true-peak limiter until integrated loudness hits the target."""
-    gain = target_lufs - analysis.integrated_lufs(x, sr)
-    y, gr = x, np.zeros(x.shape[-1])
-    for _ in range(6):
+                      release_ms: float, log: dict, start_gain_db: float | None = None) -> np.ndarray:
+    """Drive into soft clipper + true-peak limiter until integrated loudness hits the target.
+
+    Loudness after limiting is monotonic in the drive gain, so a secant search converges in
+    2-4 passes. The final drive gain is stored in log["drive_db"] for reuse at other rates.
+    """
+    def render(gain):
         y = _gain(x, gain)
         if clip_knee_db > 0:
             y = dynamics.soft_clip(y, ceiling_dbtp + clip_knee_db, knee_db=3.0)
         y, gr = dynamics.limit(y, sr, ceiling_dbtp, lookahead_ms=1.5, release_ms=release_ms)
-        err = target_lufs - analysis.integrated_lufs(y, sr)
-        if abs(err) < 0.1:
+        return y, gr, analysis.integrated_lufs(y, sr)
+
+    g0 = start_gain_db if start_gain_db is not None else target_lufs - analysis.integrated_lufs(x, sr)
+    y, gr, l0 = render(g0)
+    g1 = g0 + (target_lufs - l0) * 1.3  # limiting eats part of every boost
+    best = (abs(target_lufs - l0), g0, y, gr)
+    for _ in range(5):
+        if best[0] < 0.08:
             break
-        gain += err * 1.1  # limiting eats part of every boost; overshoot slightly to converge
+        y, gr, l1 = render(g1)
+        if abs(target_lufs - l1) < best[0]:
+            best = (abs(target_lufs - l1), g1, y, gr)
+        slope = (l1 - l0) / (g1 - g0) if abs(g1 - g0) > 1e-6 else 1.0
+        slope = float(np.clip(slope, 0.1, 1.0))
+        g0, l0 = g1, l1
+        g1 = g1 + (target_lufs - l1) / slope
+    _, gain, y, gr = best
+    log["drive_db"] = round(float(gain), 3)
     log["limiter_max_gr_db"] = round(float(np.min(gr)), 2)
     log["limiter_avg_gr_db"] = round(float(np.mean(gr)), 2)
     return y
