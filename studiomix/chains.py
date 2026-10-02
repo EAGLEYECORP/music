@@ -64,6 +64,13 @@ def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict, key=None, label: s
     # 2. rumble / plosive / handling-noise removal
     v = filters.highpass(v, sr, p.vocal_hpf_hz, order=4)
 
+    # 2b. background noise (phone / bedroom recordings): learned from the gaps between phrases
+    if p.vocal_denoise:
+        from .dsp.denoise import denoise
+
+        v, nstats = denoise(v, sr, active)
+        log["denoise"] = nstats
+
     # 3. pitch correction, on the clean raw voice (before compression/saturation colour it)
     if key is not None and p.tune_amount > 0:
         sections = isinstance(key, list)  # key per song section
@@ -76,6 +83,7 @@ def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict, key=None, label: s
 
     # 3b. soft gate (downward expander) for room noise between phrases
     frames = analysis.frame_rms_db(v, sr, 50.0)
+    frames = frames[frames > -100.0] if (frames > -100.0).sum() >= 10 else frames  # skip digital silence
     floor = float(np.percentile(frames, 10))
     if floor < -45.0:
         v, _ = dynamics.expand(v, sr, threshold_db=floor + 10.0, ratio=2.0, range_db=10.0)

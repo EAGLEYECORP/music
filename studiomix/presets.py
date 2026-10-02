@@ -12,6 +12,7 @@ class Preset:
 
     # ---- vocal chain
     vocal_hpf_hz: float = 90.0
+    vocal_denoise: bool = True          # adaptive background-noise reduction (fans, AC, hiss, hum)
     vocal_mud_cut_db: float = -2.5      # around 300 Hz
     vocal_boxy_cut_db: float = -1.5     # around 800 Hz
     vocal_presence_db: float = 2.0      # around 3.5 kHz

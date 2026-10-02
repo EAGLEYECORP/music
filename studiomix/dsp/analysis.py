@@ -86,8 +86,13 @@ def activity_mask(x: np.ndarray, sr: int, frame_ms: float = 50.0, margin_db: flo
     """
     hop = max(1, int(sr * frame_ms / 1000))
     f = frame_rms_db(x, sr, frame_ms)
-    loud = np.percentile(f, 95)
-    floor = np.percentile(f, 10)
+    # ignore digital silence (e.g. gaps between takes placed on a timeline): it says nothing about
+    # the room's noise floor and would make every bit of real noise look like singing
+    real = f[f > -100.0]
+    if len(real) < 10:
+        real = f
+    loud = np.percentile(real, 95)
+    floor = np.percentile(real, 10)
     thr = max(floor + 10.0, loud - margin_db, -80.0)
     frames = f > thr
     # close tiny gaps (consonants, breaths) with a short dilation

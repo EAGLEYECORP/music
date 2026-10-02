@@ -76,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--presence", dest="vocal_presence_db", type=float, help="vocal 3.5 kHz presence boost in dB")
     g.add_argument("--vocal-comp", dest="vocal_comp_amount", type=float, help="vocal compression amount (0-2)")
     g.add_argument("--deess", dest="vocal_deess_db", type=float, help="max de-esser reduction in dB (0 = off)")
+    g.add_argument("--no-denoise", dest="vocal_denoise", action="store_const", const=False, default=None,
+                   help="turn off background-noise reduction on the vocals")
     g.add_argument("--carve", dest="inst_carve_db", type=float,
                    help="how much the beat ducks in the vocal range while singing, in dB")
     g.add_argument("--adlib-level", dest="adlib_level_db", type=float,

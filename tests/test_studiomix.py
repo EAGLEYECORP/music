@@ -613,3 +613,39 @@ def test_studio_requires_beat_and_lead(tmp_path):
 
     with pytest.raises(ValueError):
         studio.build_tracks(tmp_path, "empty-song")
+
+
+# ------------------------------------------------------------------ noise reduction
+
+
+def _noisy_take(snr_db, seed=0):
+    t = np.arange(SR * 8) / SR
+    f = 220 * (1 + 0.01 * np.sin(2 * np.pi * 5 * t))
+    clean = sung(f) * ((t % 2.0) < 1.4)  # phrases with gaps
+    act = (t % 2.0) < 1.4
+    rng = np.random.default_rng(seed)
+    w = rng.standard_normal(len(t))
+    nz = signal.lfilter([1], [1, -0.99], w) + 0.3 * w  # fan-like
+    nz *= np.sqrt(np.mean(clean[act] ** 2) / np.mean(nz ** 2) / 10 ** (snr_db / 10))
+    return clean, clean + nz, act
+
+
+@pytest.mark.parametrize("snr", [12, 20])
+def test_denoise_removes_noise_without_hurting_the_voice(snr):
+    from studiomix.dsp.denoise import denoise
+
+    clean, noisy, act = _noisy_take(snr)
+    out, st = denoise(noisy[None], SR, act)
+    out = out[0]
+    gaps = ~act
+    assert 10 * np.log10(np.mean(out[gaps] ** 2) / np.mean(noisy[gaps] ** 2)) < -6.0
+    sdr = lambda y: 10 * np.log10(np.sum(clean[act] ** 2) / np.sum((y[act] - clean[act]) ** 2))  # noqa: E731
+    assert sdr(out) >= sdr(noisy) - 0.3
+
+
+def test_denoise_leaves_clean_takes_alone():
+    from studiomix.dsp.denoise import denoise
+
+    clean, noisy, act = _noisy_take(50)
+    out, st = denoise(noisy[None], SR, act)
+    assert st["applied"] is False and np.array_equal(out[0], noisy)
