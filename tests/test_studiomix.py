@@ -345,3 +345,48 @@ def test_end_to_end_with_stack(demo_files, tmp_path):
     rms = lambda a, b: np.sqrt(np.mean(st[:, int(a * sr):int(b * sr)] ** 2))  # noqa: E731
     assert rms(0.0, 2.5) < 1e-6 < rms(4.0, 8.0)
     assert log["output"]["true_peak_dbtp"] <= log["master"]["ceiling_dbtp"] + 0.01
+
+
+def test_web_app_end_to_end(demo_files, tmp_path):
+    """POST a song to `studiomix serve`, poll the job, download the master."""
+    import threading
+    import time as _t
+    import urllib.error
+    import urllib.request
+    import uuid as _uuid
+    from http.server import ThreadingHTTPServer
+
+    from studiomix import web
+
+    web.Handler.jobs_dir = tmp_path
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        assert b"studio" in urllib.request.urlopen(base + "/").read()
+        boundary = _uuid.uuid4().hex
+        parts = []
+        for name, path in (("lead", demo_files / "v.wav"), ("beat", demo_files / "b.wav")):
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{path.name}"\r\n'
+                         f"Content-Type: audio/wav\r\n\r\n".encode() + path.read_bytes() + b"\r\n")
+        for k, v in (("preset", "pop"), ("tune", "hard"), ("harmony", "3up")):
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+        body = b"".join(parts) + f"--{boundary}--\r\n".encode()
+        req = urllib.request.Request(base + "/api/jobs", data=body,
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        job_id = json.loads(urllib.request.urlopen(req).read())["id"]
+        for _ in range(300):
+            j = json.loads(urllib.request.urlopen(f"{base}/api/jobs/{job_id}").read())
+            if j["status"] in ("done", "error"):
+                break
+            _t.sleep(0.5)
+        assert j["status"] == "done", j.get("error")
+        assert j["result"]["output"]["integrated_lufs"] == pytest.approx(-11.0, abs=0.2)
+        assert "stack_stem" in j["result"]["files"]
+        master = urllib.request.urlopen(f"{base}/jobs/{job_id}/{j['result']['files']['master_24bit']}").read()
+        assert master[:4] == b"RIFF" and len(master) > 100_000
+        # nothing outside the job's own outputs is served
+        with pytest.raises(urllib.error.HTTPError):
+            urllib.request.urlopen(f"{base}/jobs/{job_id}/..%2F..%2Fetc%2Fpasswd")
+    finally:
+        httpd.shutdown()

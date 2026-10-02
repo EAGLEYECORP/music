@@ -23,6 +23,6 @@ echo "==> giving Termux access to your phone storage (accept the popup)"
 termux-setup-storage || true
 
 echo
-echo "Done. Example:"
-echo "  studiomix ~/storage/downloads/vocal.wav ~/storage/downloads/beat.wav \\"
-echo "      -a ~/storage/downloads/adlibs.wav -p trap -o ~/storage/downloads/master"
+echo "Done. Start the app (opens in your phone's browser):"
+echo "  studiomix serve"
+echo "Finished songs are saved in Downloads/studiomix."

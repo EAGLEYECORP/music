@@ -55,6 +55,19 @@ studiomix vocal.wav beat.wav -a adlibs.wav -p trap -o master
 The finished files appear in your phone's **Downloads/master** folder. A phone is slower than a
 computer. Expect a few minutes per song, and keep Termux open while it runs.
 
+### The app (no typing)
+
+```bash
+studiomix serve
+```
+
+This opens studiomix in your phone's browser (in Termux it uses `termux-open-url`). Pick your
+lead, beat and ad-libs with the normal file picker, choose the style, auto-tune, harmonies and
+doubles, then tap **Mix & master**. You can follow the progress, listen to the result, and
+download every file. Songs are also saved to **Downloads/studiomix**. The app only accepts
+connections from the phone itself. `studiomix serve --host 0.0.0.0` lets a laptop on the same Wi-Fi
+use it too. On a computer, the same command opens your normal browser.
+
 ## What it does
 
 **Auto-tune (pitch correction)**
@@ -94,6 +107,22 @@ and a solo trumpet):
 Known limits: near-whispered singing is still tracked only about 75% of the time. A singer more
 than about 45 cents off sits halfway between two notes, so it snaps to whichever scale note is
 nearer, which may not be the one they meant. Pass `--key` to rule out non-scale notes.
+
+**Vocal stack, Flex-Tune and key changes**
+- `--harmony 3up,5down`: harmony voices *in key*. They follow your tuned melody, and a third is
+  major or minor depending on where you are in the scale. Formants are kept, so it sounds like you
+  singing the harmony, not a chipmunk. Intervals: `3up 3down 4up 5up 5down 6down 8up 8down`.
+- `--doubles`: two double-tracks of the lead, panned wide. Each one wanders 5–22 ms late and a
+  few cents sharp or flat, which is what makes stacked vocals sound thick.
+- `--stack-at 0:45-1:15,2:10-2:40`: only stack on the hook (default: the whole song).
+- `--flex 35`: Flex-Tune. Notes within 35 cents of the target get corrected. Bigger bends, falls
+  and blue notes are treated as intentional and left alone.
+- `--key-changes`: for songs that change key. It detects a key per section, with a cost for
+  switching, so one borrowed chord doesn't flip the key.
+
+**Deep voices:** pitch tracking goes down to 50 Hz. A first pass learns the singer's range, then
+the search narrows to it, so deep voices keep their low notes and higher voices don't pick up
+fake low pitches in breath noise.
 
 **Lead vocal and ad-libs**
 1. Folds a stereo vocal to mono, then sets a fixed working level so every later stage behaves the same on every take
@@ -169,6 +198,11 @@ studiomix vox.wav beat.mp3 -p hiphop -a adlibs.wav hype.wav --tune hard --key "C
 | `--lufs -10` / `--ceiling -1` | loudness target / true-peak ceiling |
 | `--reference song.wav` | match the tone of a song you like |
 | `--offset-ms 25` | shift the vocals if they were exported late/early |
+| `--harmony 3up,5down` / `--harmony-level -9` | harmony voices in key / their level (dB) |
+| `--doubles` / `--doubles-level -7` | double-tracked lead / their level (dB) |
+| `--stack-at 0:45-1:15` | only stack harmonies/doubles in these parts |
+| `--flex 35` | Flex-Tune: leave bends beyond 35 cents alone |
+| `--key-changes` | detect a key per song section |
 
 Run `studiomix --help` for everything.
 
