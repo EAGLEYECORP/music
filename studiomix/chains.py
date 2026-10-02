@@ -306,8 +306,11 @@ def finalize_loudness(x: np.ndarray, sr: int, target_lufs: float, ceiling_dbtp: 
                       release_ms: float, log: dict, start_gain_db: float | None = None) -> np.ndarray:
     """Drive into soft clipper + true-peak limiter until integrated loudness hits the target.
 
-    Loudness after limiting is monotonic in the drive gain, so a secant search converges in
-    2-4 passes. The final drive gain is stored in log["drive_db"] for reuse at other rates.
+    Loudness after limiting is monotonic in the drive gain, so a secant search (aimed a hair
+    above the target) converges in 2-4 passes. The closest render at or just above the target
+    is then trimmed *down* to land exactly on it: the result is within 0.03 LU of the target,
+    never louder, and turning down can only lower the true peak.
+    The final drive gain is stored in log["drive_db"] for reuse at other rates.
     """
     def render(gain):
         y = _gain(x, gain)
@@ -316,21 +319,24 @@ def finalize_loudness(x: np.ndarray, sr: int, target_lufs: float, ceiling_dbtp: 
         y, gr = dynamics.limit(y, sr, ceiling_dbtp, lookahead_ms=1.5, release_ms=release_ms)
         return y, gr, analysis.integrated_lufs(y, sr)
 
+    aim = target_lufs + 0.04
     g0 = start_gain_db if start_gain_db is not None else target_lufs - analysis.integrated_lufs(x, sr)
     y, gr, l0 = render(g0)
-    g1 = g0 + (target_lufs - l0) * 1.3  # limiting eats part of every boost
-    best = (abs(target_lufs - l0), g0, y, gr)
-    for _ in range(5):
-        if best[0] < 0.08:
+    renders = [(l0, g0, y, gr)]
+    g1 = g0 + (aim - l0) * 1.3  # limiting eats part of every boost
+    for _ in range(6):
+        if any(0.0 <= l_ - target_lufs <= 0.15 for l_, *_ in renders):
             break
         y, gr, l1 = render(g1)
-        if abs(target_lufs - l1) < best[0]:
-            best = (abs(target_lufs - l1), g1, y, gr)
+        renders.append((l1, g1, y, gr))
         slope = (l1 - l0) / (g1 - g0) if abs(g1 - g0) > 1e-6 else 1.0
         slope = float(np.clip(slope, 0.1, 1.0))
         g0, l0 = g1, l1
-        g1 = g1 + (target_lufs - l1) / slope
-    _, gain, y, gr = best
+        g1 = g1 + (aim - l1) / slope
+    above = [r for r in renders if r[0] >= target_lufs]
+    lufs, gain, y, gr = min(above, key=lambda r: r[0]) if above else max(renders, key=lambda r: r[0])
+    if lufs > target_lufs:
+        y = _gain(y, target_lufs - lufs)  # final exact trim (down only)
     log["drive_db"] = round(float(gain), 3)
     log["limiter_max_gr_db"] = round(float(np.min(gr)), 2)
     log["limiter_avg_gr_db"] = round(float(np.mean(gr)), 2)

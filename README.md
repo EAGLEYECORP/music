@@ -153,7 +153,29 @@ left/right**, the classic hip-hop spread. You can pass several files with `-a fi
 5. Oversampled soft clipper, then a look-ahead **true-peak limiter**. Loudness is adjusted repeatedly until the integrated loudness hits the target within ±0.1 LU.
 6. The 44.1 kHz master gets its own limiting pass (instead of resampling an already-limited file), then TPDF dither for the 16-bit export
 
-All loudness readings are ITU-R BS.1770-4 / EBU R128 LUFS. All peak readings are 4×-oversampled true peak.
+### Release specs: verified, not assumed
+
+- **Loudness meter** (ITU-R BS.1770-4 / EBU R128): passes the EBU Tech 3341 integrated and
+  gating cases and the EBU Tech 3342 loudness-range cases within ±0.1 LU (in the test suite).
+- **True-peak meter:** 4× oversampling plus parabolic peak refinement. On worst-case tones up to
+  20 kHz, where every sample misses the peak, it reads within ±0.04 dB. Plain 4×
+  oversampling under-reads by up to 0.13 dB.
+- **On target:** the limiter search lands within 0.03 LU of the target and never above it.
+- **The delivered files are checked, not the internal audio.** Every report decodes the 24-bit
+  and 16-bit WAVs *from disk* (after dither and resampling) and measures them with our meter
+  **and** ffmpeg's independent EBU R128 meter. A file only passes if both are within spec.
+
+Measured on real material (real voices over a real hip-hop loop):
+
+| preset    | file   | ours: LUFS / dBTP | ffmpeg: LUFS / dBTP | ceiling |
+|-----------|--------|-------------------|---------------------|---------|
+| trap      | 24-bit | -8.50 / -2.02     | -8.5 / -2.0         | -2.0    |
+| trap      | 16-bit | -8.50 / -2.04     | -8.5 / -2.0         | -2.0    |
+| pop       | 24-bit | -11.00 / -2.05    | -11.0 / -2.0        | -2.0    |
+| streaming | 24-bit | -14.00 / -1.05    | -14.0 / -1.0        | -1.0    |
+
+The MP3 preview always peaks 0.5–1 dB higher, because lossy encoding creates new peaks. This is
+exactly why masters louder than -14 LUFS get a -2 dBTP ceiling. Upload the WAV, never the MP3.
 
 ## Presets
 

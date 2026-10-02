@@ -240,11 +240,20 @@ def run(
             files[stem_name] = pth.name
 
     # ---------------------------------------------------------------- report
+    say("verifying the delivered files (our meter + ffmpeg EBU R128)")
     final = analysis.measure(master, sr)
+    deliverables = {}
+    for key_ in ("master_24bit", "master_16bit_cd", "mp3_preview"):
+        if key_ in files:
+            pth = out_dir / files[key_]
+            dec, dsr = audio_io.load(pth)  # what is actually on disk: dither, rate, encoding
+            ours = analysis.measure(dec, dsr)
+            deliverables[key_] = {"file": files[key_], "ours": ours, "ffmpeg": analysis.ffmpeg_ebur128(pth)}
     log["output"] = final
+    log["deliverables"] = deliverables
     log["files"] = files
     log["settings"] = asdict(preset)
-    log["delivery_check"] = delivery_check(final, ceiling)
+    log["delivery_check"] = delivery_check(final, ceiling, preset.target_lufs, deliverables)
     log["processing_seconds"] = round(time.time() - t0, 1)
 
     (out_dir / f"{name}_report.json").write_text(json.dumps(log, indent=2))
@@ -252,17 +261,43 @@ def run(
     return log
 
 
-def delivery_check(m: dict, ceiling: float) -> list[dict]:
-    lufs, tp = m["integrated_lufs"], m["true_peak_dbtp"]
+def delivery_check(m: dict, ceiling: float, target: float | None = None,
+                   deliverables: dict | None = None) -> list[dict]:
+    """Release checks, judged on the files as written (both WAVs, both meters) when available."""
+    lufs = m["integrated_lufs"]
+    wavs = {k: d for k, d in (deliverables or {}).items() if k != "mp3_preview"}
+    if wavs:
+        tp_ours = max(d["ours"]["true_peak_dbtp"] for d in wavs.values())
+        sp = max(d["ours"]["sample_peak_dbfs"] for d in wavs.values())
+        ff = [d["ffmpeg"] for d in wavs.values() if d.get("ffmpeg")]
+        tp_ff = max((f["true_peak_dbtp"] for f in ff), default=None)
+        lufs_all = [d["ours"]["integrated_lufs"] for d in wavs.values()] + [f["integrated_lufs"] for f in ff]
+    else:
+        tp_ours, sp, tp_ff, ff, lufs_all = m["true_peak_dbtp"], m["sample_peak_dbfs"], None, [], [lufs]
+    tp = tp_ours if tp_ff is None else max(tp_ours, tp_ff - 0.05)  # ffmpeg prints 0.1 dB steps
+    where = "24-bit + 16-bit files" if len(wavs) > 1 else "master"
     checks = [
-        {"check": "True peak within ceiling", "ok": tp <= ceiling + 0.05,
-         "detail": f"{tp} dBTP (ceiling {ceiling})"},
+        {"check": "True peak within ceiling", "ok": tp <= ceiling + 0.005,
+         "detail": f"{tp_ours:.2f} dBTP" + (f" (ffmpeg {tp_ff:.1f})" if tp_ff is not None else "")
+                   + f", ceiling {ceiling} - {where}"},
         {"check": "Spotify true-peak rule (<= -1 dBTP; <= -2 dBTP if louder than -14 LUFS)",
-         "ok": tp <= (-2.0 if lufs > -14.0 else -1.0) + 0.05, "detail": f"{tp} dBTP @ {lufs} LUFS"},
-        {"check": "No clipping", "ok": m["sample_peak_dbfs"] < 0.0, "detail": f"sample peak {m['sample_peak_dbfs']} dBFS"},
+         "ok": tp <= (-2.0 if lufs > -14.0 else -1.0) + 0.005, "detail": f"{tp_ours:.2f} dBTP @ {lufs} LUFS"},
+        {"check": "No clipping", "ok": sp < 0.0, "detail": f"sample peak {sp:.2f} dBFS"},
+    ]
+    if target is not None:
+        worst = max(abs(v - target) for v in lufs_all)
+        checks.append({"check": "Loudness on target (+-0.1 LU, every file, both meters)", "ok": worst <= 0.1 + 0.05 * bool(ff),
+                       "detail": ", ".join(f"{v:.2f}" for v in lufs_all) + f" LUFS (target {target})"})
+    if ff:
+        ours_i = [d["ours"]["integrated_lufs"] for d in wavs.values() if d.get("ffmpeg")]
+        diff = max(abs(o - f["integrated_lufs"]) for o, f in zip(ours_i, ff))
+        checks.append({"check": "Independent meter agrees (ffmpeg EBU R128)", "ok": diff <= 0.15,
+                       "detail": f"loudness within {diff:.2f} LU of ours"})
+    checks += [
         {"check": "Mono compatible (stereo correlation > 0)", "ok": m["stereo_correlation"] > 0.0,
          "detail": f"{m['stereo_correlation']}"},
-        {"check": "Healthy dynamics (PLR >= 7 dB)", "ok": m["plr_db"] >= 7.0, "detail": f"PLR {m['plr_db']} dB"},
+        {"check": "Dynamics (PLR >= 7 dB; loud trap masters often sit at 6-7)", "ok": m["plr_db"] >= 7.0,
+         "detail": f"PLR {m['plr_db']} dB"},
     ]
     turn_down = max(0.0, lufs + 14.0)
     checks.append({
@@ -304,6 +339,15 @@ def format_report(name: str, log: dict) -> str:
             lines.append(f"  {section:12s} {k:24s} {v}")
     if log.get("key", {}).get("note"):
         lines.append(f"  NOTE: {log['key']['note']}")
+    if log.get("deliverables"):
+        lines += ["", "DELIVERED FILES (decoded from disk)        ours: LUFS / dBTP / LRA      ffmpeg: LUFS / dBTP"]
+        for d in log["deliverables"].values():
+            o_, f_ = d["ours"], d.get("ffmpeg") or {}
+            ff_txt = (f"{f_.get('integrated_lufs', float('nan')):6.1f} / {f_.get('true_peak_dbtp', float('nan')):5.1f}"
+                      if f_ else "n/a (install ffmpeg)")
+            lines.append(f"  {d['file'][:40]:40s} {o_['integrated_lufs']:6.2f} / {o_['true_peak_dbtp']:5.2f} / "
+                         f"{o_['loudness_range_lu']:4.1f}      {ff_txt}")
+        lines.append("  (the MP3 is a preview: lossy encoding adds ~0.5-1 dB of peaks - never upload it)")
     lines += ["", "DELIVERY CHECKS"]
     for c in log["delivery_check"]:
         lines.append(f"  [{'PASS' if c['ok'] else 'WARN'}] {c['check']}: {c['detail']}")

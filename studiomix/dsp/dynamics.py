@@ -185,17 +185,33 @@ def deess(x: np.ndarray, sr: int, active: np.ndarray, split_hz: float = 4500.0, 
 
 # ---------------------------------------------------------------- limiting
 
+def _refined_peaks(up: np.ndarray) -> np.ndarray:
+    """|signal| with each local extremum replaced by the vertex of the parabola through it and its
+    two neighbours. A 4x-oversampled grid can still miss the top of a fast peak by ~0.15 dB; the
+    parabola recovers it (worst-case error < 0.02 dB), at a fraction of the cost of 8x."""
+    a0, a1, a2 = up[..., :-2], up[..., 1:-1], up[..., 2:]
+    den = a0 - 2.0 * a1 + a2
+    is_ext = ((a1 >= a0) & (a1 >= a2)) | ((a1 <= a0) & (a1 <= a2))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vertex = a1 - (a2 - a0) ** 2 / (8.0 * den)
+    vertex = np.where(is_ext & (np.abs(den) > 1e-12), vertex, a1)
+    out = np.abs(up)
+    out[..., 1:-1] = np.maximum(out[..., 1:-1], np.abs(vertex))
+    return out
+
+
 def true_peak_envelope(x: np.ndarray, oversample: int = 4) -> np.ndarray:
     """Per-sample true-peak magnitude (max over the oversampled signal, all channels)."""
     n = x.shape[-1]
     up = signal.resample_poly(x, oversample, 1, axis=-1)
-    a = np.max(np.abs(up), axis=0)[: n * oversample].reshape(n, oversample).max(axis=1)
+    a = np.max(_refined_peaks(up), axis=0)[: n * oversample].reshape(n, oversample).max(axis=1)
     return np.maximum(a, np.roll(a, -1))  # inter-sample peaks straddle two samples
 
 
 def true_peak_db(x: np.ndarray, oversample: int = 4) -> float:
+    """ITU-R BS.1770-style true peak (dBTP): 4x oversampling plus parabolic peak refinement."""
     up = signal.resample_poly(x, oversample, 1, axis=-1)
-    return float(20.0 * np.log10(np.max(np.abs(up)) + EPS))
+    return float(20.0 * np.log10(np.max(_refined_peaks(up)) + EPS))
 
 
 def soft_clip(x: np.ndarray, ceiling_db: float, knee_db: float = 3.0, oversample: int = 4) -> np.ndarray:

@@ -143,3 +143,28 @@ def measure(x: np.ndarray, sr: int) -> dict:
         "stereo_correlation": round(stereo_correlation(x), 3),
         "duration_s": round(x.shape[-1] / sr, 2),
     }
+
+
+def ffmpeg_ebur128(path) -> dict | None:
+    """Independent second opinion from ffmpeg's EBU R128 meter (integrated, LRA, true peak).
+
+    Returns None when ffmpeg isn't installed. ffmpeg's true peak uses its own 4x oversampler,
+    so small (< ~0.1 dB) differences from ours are normal.
+    """
+    import re
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        return None
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af",
+                        "ebur128=peak=true:framelog=quiet", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    summary = r.stderr[r.stderr.rfind("Summary:"):]
+    vals = {}
+    for key, pat in (("integrated_lufs", r"I:\s*(-?[\d.]+|-inf) LUFS"), ("loudness_range_lu", r"LRA:\s*(-?[\d.]+) LU"),
+                     ("true_peak_dbtp", r"Peak:\s*(-?[\d.]+|-inf) dBFS")):
+        m = re.search(pat, summary)
+        if m:
+            vals[key] = float(m.group(1)) if m.group(1) != "-inf" else -float("inf")
+    return vals or None

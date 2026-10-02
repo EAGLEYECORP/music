@@ -390,3 +390,52 @@ def test_web_app_end_to_end(demo_files, tmp_path):
             urllib.request.urlopen(f"{base}/jobs/{job_id}/..%2F..%2Fetc%2Fpasswd")
     finally:
         httpd.shutdown()
+
+
+# ------------------------------------------------------------------ metering compliance
+
+
+def _ebu_sine(db, secs, sr=48000, f=1000.0):
+    t = np.arange(int(sr * secs)) / sr
+    return np.sin(2 * np.pi * f * t) * 10 ** (db / 20)
+
+
+@pytest.mark.parametrize("segments,expected", [
+    ([(-23, 20)], -23.0),                                           # EBU Tech 3341 case 1
+    ([(-33, 20)], -33.0),                                           # case 2
+    ([(-36, 10), (-23, 60), (-36, 10)], -23.0),                     # case 3: relative gate
+    ([(-72, 10), (-36, 10), (-23, 60), (-36, 10), (-72, 10)], -23.0),  # case 4: both gates
+    ([(-26, 20), (-20, 20.1), (-26, 20)], -23.0),                   # case 5
+])
+def test_ebu_3341_integrated_loudness(segments, expected):
+    x = np.concatenate([_ebu_sine(db, s) for db, s in segments])
+    assert analysis.integrated_lufs(np.vstack([x, x]), 48000) == pytest.approx(expected, abs=0.1)
+
+
+@pytest.mark.parametrize("a,b,expected", [(-20, -30, 10.0), (-20, -15, 5.0), (-40, -20, 20.0)])
+def test_ebu_3342_loudness_range(a, b, expected):
+    x = np.concatenate([_ebu_sine(a, 20), _ebu_sine(b, 20)])
+    assert analysis.loudness_range(np.vstack([x, x]), 48000) == pytest.approx(expected, abs=1.0)
+
+
+@pytest.mark.parametrize("sr", [44100, 48000])
+def test_true_peak_worst_case_tones(sr):
+    """Tones whose samples always miss the peak, up to 20 kHz: error must stay within 0.05 dB."""
+    n = np.arange(sr // 2)
+    fade = np.minimum(1, np.minimum(n, len(n) - 1 - n) / 2000)
+    for num, den in ((1, 4), (1, 3), (3, 8), (2, 5), (5, 12), (1, 8), (7, 16)):
+        if num / den * sr > 20000:
+            continue
+        for ph in np.linspace(0, np.pi, 9):
+            x = np.sin(2 * np.pi * num * n / den + ph) * 0.5 * fade
+            err = dynamics.true_peak_db(np.vstack([x, x])) - 20 * np.log10(0.5)
+            assert abs(err) < 0.05, (num, den, ph, err)
+
+
+def test_loudness_lands_exactly_on_target():
+    x = np.random.default_rng(0).standard_normal((2, 48000 * 12)) * 0.05
+    for target, ceiling in ((-14.0, -1.0), (-9.0, -2.0)):
+        y = chains.finalize_loudness(x, 48000, target, ceiling, 2.0, 80.0, {})
+        got = analysis.integrated_lufs(y, 48000)
+        assert target - 0.03 <= got <= target + 1e-6
+        assert dynamics.true_peak_db(y) <= ceiling
