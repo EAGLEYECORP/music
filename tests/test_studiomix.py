@@ -496,3 +496,49 @@ def test_cli_master_and_deliver_validation(rough_mix, tmp_path, capsys):
 
     assert main(["master", str(rough_mix), "-o", str(tmp_path), "--deliver", "nope", "-q"]) == 1
     assert "unknown delivery version" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ reference profiles
+
+
+def test_learn_profile_and_master_toward_it(rough_mix, tmp_path, monkeypatch):
+    from studiomix import profiles
+    from studiomix.engine import master_mix
+
+    monkeypatch.setenv("STUDIOMIX_PROFILES", str(tmp_path / "profiles"))
+    # a "reference": a bright, wide, -10 LUFS take on the demo beat
+    ref = make_demo.beat(48000, 20.0)
+    ref = filters.eq(ref, 48000, "highshelf", 4000.0, 6.0)
+    mid, side = 0.5 * (ref[0] + ref[1]), 0.5 * (ref[0] - ref[1]) + 0.3 * filters.bandpass(ref[:1], 48000, 500, 8000)[0]
+    ref = chains.finalize_loudness(np.vstack([mid + side, mid - side]), 48000, -10.0, -1.0, 0.0, 80.0, {})
+    audio_io.write_wav(tmp_path / "ref.wav", ref, 48000)
+
+    prof = profiles.learn([tmp_path / "ref.wav"], "My Sound")
+    assert prof["name"] == "my-sound" and profiles.list_profiles() == ["my-sound"]
+    assert prof["target_lufs"] == pytest.approx(-10.0, abs=0.1)
+    assert "my-sound" in profiles.describe(profiles.load("my-sound"))
+
+    def distance(path):
+        a = profiles.analyse(path)
+        c = np.array([np.nan if v is None else v for v in a["curve_db"]])
+        g = np.array(prof["grid_hz"])
+        band = (g >= 100) & (g <= 12000)
+        return np.sqrt(np.nanmean((c - np.array(prof["curve_db"]))[band] ** 2))
+
+    p = get_preset("hiphop")
+    plain = master_mix(rough_mix, tmp_path / "a", p, name="a", verbose=False)
+    matched = master_mix(rough_mix, tmp_path / "b", profiles.apply(prof, p), name="b", verbose=False, profile=prof)
+    assert matched["output"]["integrated_lufs"] == pytest.approx(-10.0, abs=0.1)
+    assert distance(tmp_path / "b" / matched["files"]["master_24bit"]) < \
+        distance(tmp_path / "a" / plain["files"]["master_24bit"]) - 0.5
+    assert matched["delivery_check"][0]["ok"]  # still within the true-peak ceiling
+
+
+def test_profile_errors(tmp_path, monkeypatch):
+    from studiomix import profiles
+
+    monkeypatch.setenv("STUDIOMIX_PROFILES", str(tmp_path))
+    with pytest.raises(KeyError):
+        profiles.load("nope")
+    with pytest.raises(ValueError):
+        profiles._safe("!!!")

@@ -14,6 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="studiomix",
         usage="studiomix VOCAL INSTRUMENTAL [options]\n"
               "       studiomix master MIX [options]                (master a finished/rough mix)\n"
+              "       studiomix learn REFS... --name NAME           (learn a reference profile)\n"
               "       studiomix serve [--host HOST] [--port PORT]   (phone/browser app)",
         description="Mix a vocal over an instrumental and master it for Spotify, Apple Music, YouTube & co.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -51,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--deliver", metavar="VERSIONS",
                     help="extra verified versions: " + ", ".join(f"{k} ({v[1]} LUFS)" for k, v in DELIVERY_PROFILES.items()))
+    ap.add_argument("--profile", metavar="NAME",
+                    help="master toward a learned reference profile (see: studiomix learn / studiomix profiles)")
 
     st = ap.add_argument_group("vocal stack (built from the tuned lead)")
     st.add_argument("--doubles", action="store_const", const=True, default=None,
@@ -155,6 +158,7 @@ def master_main(argv: list[str]) -> int:
     ap.add_argument("--width", dest="master_width", type=float)
     ap.add_argument("--deliver", metavar="VERSIONS",
                     help="extra verified versions: " + ", ".join(DELIVERY_PROFILES))
+    ap.add_argument("--profile", metavar="NAME", help="master toward a learned reference profile")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
     from pathlib import Path
@@ -167,9 +171,15 @@ def master_main(argv: list[str]) -> int:
             if not Path(f_).is_file():
                 raise FileNotFoundError(f"file not found: {f_}")
         preset = get_preset(a.preset, **{k: v for k, v in vars(a).items() if v is not None})
+        prof = None
+        if a.profile:
+            from . import profiles
+
+            prof = profiles.load(a.profile)
+            preset = profiles.apply(prof, preset, keep_loudness=a.target_lufs is not None)
         log = master_mix(a.mix, a.out, preset, name=a.name, reference_path=a.reference,
                          vocal_lift_db=a.vocal_lift, ceiling_overridden=a.ceiling_dbtp is not None,
-                         deliver_extra=extra, verbose=not a.quiet)
+                         deliver_extra=extra, verbose=not a.quiet, profile=prof)
     except (FileNotFoundError, ValueError, RuntimeError, KeyError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -177,8 +187,54 @@ def master_main(argv: list[str]) -> int:
     return 0
 
 
+def learn_main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="studiomix learn",
+                                 description="Learn the sound of released songs you like into a reusable profile. "
+                                             "Run it again with more songs to add them to the same profile.")
+    ap.add_argument("refs", nargs="+", help="reference songs (wav/mp3/m4a...)")
+    ap.add_argument("-n", "--name", required=True, help="profile name, e.g. maes")
+    a = ap.parse_args(argv)
+    from pathlib import Path
+
+    from . import profiles
+
+    missing = [r for r in a.refs if not Path(r).is_file()]
+    if missing:
+        print(f"error: file not found: {missing[0]}", file=sys.stderr)
+        return 1
+    try:
+        prof = profiles.learn(a.refs, a.name, progress=lambda m: print(f"  - {m}", flush=True))
+    except (ValueError, RuntimeError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(profiles.describe(prof))
+    print(f"saved to {profiles.profile_dir() / (prof['name'] + '.json')}")
+    print(f"use it with:  --profile {prof['name']}")
+    return 0
+
+
+def profiles_main(argv: list[str]) -> int:
+    from . import profiles
+
+    names = profiles.list_profiles()
+    if not names:
+        print("no profiles yet - create one with: studiomix learn REFS... --name NAME")
+        return 0
+    for n in (argv or names):
+        try:
+            print(profiles.describe(profiles.load(n)))
+        except KeyError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "learn":
+        return learn_main(argv[1:])
+    if argv and argv[0] == "profiles":
+        return profiles_main(argv[1:])
     if argv and argv[0] == "serve":
         from .web import serve_main
 
@@ -212,7 +268,13 @@ def main(argv: list[str] | None = None) -> int:
         check_harmonies(args.harmonies)
         stack_at = parse_time_ranges(args.stack_at)
         extra = parse_deliver(args.deliver)
-    except ValueError as e:
+        prof = None
+        if args.profile:
+            from . import profiles
+
+            prof = profiles.load(args.profile)
+            preset = profiles.apply(prof, preset, keep_loudness=args.target_lufs is not None)
+    except (ValueError, KeyError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
@@ -224,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
             name=args.name, reference_path=args.reference, vocal_offset_ms=args.offset_ms,
             ceiling_overridden=args.ceiling_dbtp is not None, export_stems=not args.no_stems,
             verbose=not args.quiet, adlib_paths=args.adlibs, key=args.key,
-            key_changes=args.key_changes, stack_at=stack_at, deliver_extra=extra,
+            key_changes=args.key_changes, stack_at=stack_at, deliver_extra=extra, profile=prof,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)

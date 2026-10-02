@@ -50,6 +50,27 @@ Auto-tune, de-essing a single vocal, and vocal-to-beat balance need the separate
 use the main command for those. Pulling the vocal out of a finished mix takes an AI separation
 model, which is too heavy to run on a phone.
 
+## Teach it your sound (reference profiles)
+
+```bash
+studiomix learn maes1.mp3 maes2.mp3 ninho.wav --name maes      # once (add more songs any time)
+studiomix vocal.wav beat.wav --profile maes                    # or
+studiomix master mix.wav --profile maes
+```
+
+`learn` measures released songs you love and saves a **profile**: their loudness, their tonal
+balance (below each file's lossy cutoff, so MP3s don't teach it a dull top end), and their stereo
+width in four bands. Only the numbers are stored, never the audio. With `--profile`, the master:
+
+- aims at the profile's loudness (kept between -16 and -7.5 LUFS; `--lufs` overrides it)
+- matches its tonal balance in two passes. The second pass re-measures after the compressors,
+  so the result really lands there.
+- nudges each band's width toward the references, while the bass stays mono
+
+The more references, the better the target. One song's arrangement colours its spectrum; an
+average of 3–5 songs is the sound. In the app, open **Reference library**, add songs and tap
+*Learn this sound*, then choose it under **Sound like**. `studiomix profiles` lists what's saved.
+
 ## Broadcast and platform versions
 
 `--deliver` (on both commands, and as chips in the app) renders extra 24-bit versions from the

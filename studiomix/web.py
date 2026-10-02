@@ -82,10 +82,24 @@ def _run_job(job: dict) -> None:
             job["started"] = time.time()
         try:
             o = job["options"]
+            prof = None
+            if job["mode"] == "learn":
+                from . import profiles
+
+                p_ = profiles.learn(job["refs"], job["name"], progress=progress)
+                with _jobs_lock:
+                    job["status"] = "done"
+                    job["result"] = {"profile": p_["name"], "text": profiles.describe(p_), "files": {}}
+                return
+            if o.get("profile"):
+                from . import profiles
+
+                prof = profiles.load(o["profile"])
+                job["preset"] = profiles.apply(prof, job["preset"], keep_loudness=o.get("lufs_set", False))
             if job["mode"] == "mix":
                 log = master_mix(job["mix"], job["out"], job["preset"], name=job["name"],
                                  reference_path=job.get("reference"), vocal_lift_db=o.get("vocal_lift", 0.0),
-                                 deliver_extra=o.get("deliver"), verbose=False, progress=progress)
+                                 deliver_extra=o.get("deliver"), verbose=False, progress=progress, profile=prof)
             else:
                 if o.get("key"):
                     pitch.parse_key(o["key"])
@@ -94,7 +108,7 @@ def _run_job(job: dict) -> None:
                     job["lead"], job["beat"], job["out"], job["preset"], name=job["name"],
                     adlib_paths=job["adlibs"], key=o.get("key") or None, key_changes=o.get("key_changes", False),
                     stack_at=parse_time_ranges(o.get("stack_at")), verbose=False, progress=progress,
-                    deliver_extra=o.get("deliver"),
+                    deliver_extra=o.get("deliver"), profile=prof,
                 )
             with _jobs_lock:
                 job["status"] = "done"
@@ -141,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
                 job = _jobs.get(m.group(1))
                 if not job:
                     return self._json(404, {"error": "no such job"})
-                view = {k: job.get(k) for k in ("id", "status", "log", "error", "result", "name")}
+                view = {k: job.get(k) for k in ("id", "status", "log", "error", "result", "name", "mode")}
                 view["out_dir"] = str(job["out"])
             return self._json(200, view)
         m = re.fullmatch(r"/jobs/([0-9a-f]{12})/([^/]+)", self.path)
@@ -162,7 +176,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/api/jobs":
+        if self.path not in ("/api/jobs", "/api/learn"):
             return self._json(404, {"error": "not found"})
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0 or length > MAX_UPLOAD:
@@ -172,6 +186,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "expected a form upload"})
         fields, files = _parse_multipart(ctype, self.rfile.read(length))
         f = lambda k, d="": (fields.get(k) or [d])[0].strip()  # noqa: E731
+        if self.path == "/api/learn":
+            if not files.get("refs"):
+                return self._json(400, {"error": "choose one or more reference songs"})
+            from . import profiles
+
+            try:
+                pname = profiles._safe(f("profile_name") or "my-sound")
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            job_id = uuid.uuid4().hex[:12]
+            ref_dir = self.jobs_dir / "references" / pname
+            ref_dir.mkdir(parents=True, exist_ok=True)
+            paths = []
+            for i, it in enumerate(files["refs"]):
+                pth = ref_dir / _safe_name(it[0], f"ref{i + 1}")
+                pth.write_bytes(it[1])
+                paths.append(pth)
+            job = {"id": job_id, "status": "queued", "log": [], "name": pname, "out": ref_dir, "mode": "learn",
+                   "refs": paths, "options": {}, "started": time.time(), "preset": None}
+            with _jobs_lock:
+                _jobs[job_id] = job
+            threading.Thread(target=_run_job, args=(job,), daemon=True).start()
+            return self._json(200, {"id": job_id})
+
         mode = "mix" if f("mode") == "mix" else "stems"
         if mode == "mix" and not files.get("mix"):
             return self._json(400, {"error": "choose your mix file"})
@@ -224,7 +262,8 @@ class Handler(BaseHTTPRequestHandler):
             "id": job_id, "status": "queued", "log": [], "name": name, "out": out, "preset": preset, "mode": mode,
             "options": {"key": f("key"), "key_changes": f("key_changes") == "on", "harmonies": harmonies,
                         "stack_at": f("stack_at"), "deliver": deliver,
-                        "vocal_lift": 2.0 if f("vocal_lift") == "on" else 0.0},
+                        "vocal_lift": 2.0 if f("vocal_lift") == "on" else 0.0,
+                        "profile": f("profile"), "lufs_set": bool(f("lufs"))},
             "started": time.time(),
         }
         if mode == "mix":
@@ -244,7 +283,11 @@ class Handler(BaseHTTPRequestHandler):
 def render_page() -> str:
     presets = "".join(f'<option value="{p.name}"{" selected" if p.name == "pop" else ""}>'
                       f'{p.name} - {p.description}</option>' for p in PRESETS.values())
-    return PAGE.replace("{{PRESETS}}", presets).replace("{{VERSION}}", __version__)
+    from . import profiles
+
+    profs = "".join(f'<option value="{n}">{n}</option>' for n in profiles.list_profiles())
+    return (PAGE.replace("{{PRESETS}}", presets).replace("{{VERSION}}", __version__)
+            .replace("{{PROFILES}}", profs))
 
 
 def serve_main(argv: list[str]) -> int:
@@ -355,6 +398,8 @@ audio { width: 100%; margin: 4px 0 12px; }
   margin-bottom: 8px; color: var(--text); text-decoration: none; }
 .dl a span { color: var(--muted); font-size: 13px; }
 .err { color: #ff6b6b; font-weight: 600; }
+button.small { margin-top: 10px; width: 100%; border: 1px solid var(--accent); background: transparent; color: var(--accent);
+  border-radius: 12px; padding: 12px; font: 700 15px system-ui, sans-serif; cursor: pointer; }
 .modes { grid-template-columns: 1fr 1fr; margin-bottom: 14px; }
 .modes label { padding: 12px 0; font-size: 15px; }
 body.mode-mix .only-stems { display: none; }
@@ -399,6 +444,9 @@ body:not(.mode-mix) .only-mix { display: none; }
 <section>
   <h2>Sound</h2>
   <div class="row"><div class="stack"><div class="lbl">Style</div><select name="preset">{{PRESETS}}</select></div></div>
+  <div class="row"><div class="stack"><div class="lbl">Sound like <span class="muted">(your reference library)</span></div>
+    <select name="profile" id="profsel"><option value="">— no reference profile —</option>{{PROFILES}}</select>
+    <div class="hint">Matches loudness, tonal balance and stereo width of the songs you taught it</div></div></div>
   <div class="row only-stems"><div class="stack"><div class="lbl">Auto-tune</div>
     <div class="seg">
       <input type="radio" name="tune" id="t0" value="off"><label for="t0">Off</label>
@@ -450,6 +498,19 @@ body:not(.mode-mix) .only-mix { display: none; }
 </section>
 </form>
 
+<section>
+  <details id="libbox"><summary>Reference library — teach it a sound</summary>
+    <form id="lf">
+      <label class="file"><input type="file" name="refs" accept="audio/*,.wav,.mp3,.flac,.m4a" multiple required>
+        <div class="icon">📚</div><div><div class="t">Released songs you love</div><div class="s">Tap to choose · several ok · only numbers are kept</div></div></label>
+      <div class="row"><div class="stack"><div class="lbl">Profile name</div>
+        <input type="text" name="profile_name" placeholder="e.g. maes" autocomplete="off" required></div></div>
+      <button type="submit" class="small" id="learnbtn">Learn this sound</button>
+      <pre id="learnout" class="muted" style="white-space:pre-wrap;margin:10px 0 0"></pre>
+    </form>
+  </details>
+</section>
+
 <section id="progress">
   <h2 id="ptitle">Uploading</h2>
   <div class="bar"><i id="pbar"></i></div>
@@ -481,6 +542,29 @@ const LABELS = {master_24bit: ["Master · 24-bit WAV", "upload this to your dist
   "version_atsc-a85": ["Radio/TV US · ATSC A/85", "-24 LKFS, -2 dBTP max"],
   "version_apple": ["Apple Music level", "-16 LUFS, -1 dBTP max"],
   "version_streaming": ["Streaming level", "-14 LUFS, -1 dBTP max"]};
+$("#lf").addEventListener("submit", async e => {
+  e.preventDefault();
+  const btn = $("#learnbtn"), out = $("#learnout");
+  btn.disabled = true; btn.textContent = "Learning…"; out.textContent = "";
+  try {
+    const r = await (await fetch("/api/learn", {method: "POST", body: new FormData($("#lf"))})).json();
+    if (!r.id) throw new Error(r.error || "failed");
+    for (;;) {
+      const j = await (await fetch("/api/jobs/" + r.id)).json();
+      out.textContent = (j.log || []).map(l => l.msg).join("\n");
+      if (j.status === "error") throw new Error(j.error);
+      if (j.status === "done") {
+        out.textContent = j.result.text;
+        const sel = $("#profsel");
+        if (![...sel.options].some(o => o.value === j.result.profile)) sel.add(new Option(j.result.profile, j.result.profile));
+        sel.value = j.result.profile;
+        break;
+      }
+      await new Promise(res => setTimeout(res, 1000));
+    }
+  } catch (err) { out.innerHTML = '<span class="err"></span>'; out.firstChild.textContent = "Couldn't learn: " + err.message; }
+  btn.disabled = false; btn.textContent = "Learn this sound";
+});
 function setMode() {
   const mix = document.querySelector("input[name=mode]:checked").value === "mix";
   document.body.classList.toggle("mode-mix", mix);

@@ -360,12 +360,43 @@ def repair_mix(x: np.ndarray, sr: int, p: Preset, diag: dict, vocal_lift_db: flo
 
 # ------------------------------------------------------------------ master
 
-def master_chain(mix: np.ndarray, sr: int, p: Preset, log: dict, reference: np.ndarray | None = None) -> np.ndarray:
+def match_width(x: np.ndarray, sr: int, targets: dict, strength: float = 0.7, max_db: float = 4.0) -> dict:
+    """Nudge the side (stereo) level of each band toward a profile's side/mid ratio, in place.
+    Bands below 120 Hz are never touched: the low end stays mono."""
+    from .profiles import side_mid_db
+
+    mid = 0.5 * (x[0] + x[1])
+    side = 0.5 * (x[0] - x[1])
+    applied = {}
+    for key, target in targets.items():
+        a, b = (float(v) for v in key.split("-"))
+        if a < 120 or b > sr * 0.45:
+            continue
+        cur = side_mid_db(np.vstack([mid + side, mid - side]), sr, a, b)
+        g_db = float(np.clip((target - cur) * strength, -max_db, max_db))
+        if abs(g_db) < 0.2:
+            continue
+        band = filters.bandpass(side[None, :], sr, a, b, order=2)[0]
+        side = side + (10 ** (g_db / 20) - 1.0) * band
+        applied[key] = round(g_db, 2)
+    x[0], x[1] = mid + side, mid - side
+    return applied
+
+
+def master_chain(mix: np.ndarray, sr: int, p: Preset, log: dict, reference: np.ndarray | None = None,
+                 profile: dict | None = None) -> np.ndarray:
     """Tonal balance, multiband + glue compression and stereo imaging (pre-limiter)."""
     x = mix
 
-    # 1. tonal balance: toward a reference track if given, else a commercial-mix spectral tilt
-    if reference is not None:
+    # 1. tonal balance: toward a learned profile, a reference track, or a commercial-mix tilt
+    if profile is not None:
+        g = np.array(profile["grid_hz"])
+        c = np.array(profile["curve_db"])
+        hi = min(16000.0, 0.95 * min(t["lossy_cutoff_hz"] for t in profile["tracks"]))
+        x, marks = _tonal_correction(x, sr, lambda f: np.interp(np.log2(np.maximum(f, 20.0)), np.log2(g), c),
+                                     0.6, 4.0, 30.0, hi, 1 / 2)
+        log["tonal_match"] = f"profile '{profile['name']}' ({len(profile['tracks'])} refs)"
+    elif reference is not None:
         rf, rdb = filters.ltas_db(np.mean(reference, axis=0), sr)
         rdb = filters.fractional_octave_smooth(rf, rdb, 1 / 3)
         x, marks = _tonal_correction(x, sr, lambda f: np.interp(f, rf, rdb), 0.7, 6.0, 30.0, 16000.0, 1 / 2)
@@ -402,8 +433,20 @@ def master_chain(mix: np.ndarray, sr: int, p: Preset, log: dict, reference: np.n
         x, gr = dynamics.compress(x, sr, thr, p.master_glue_ratio, 30.0, 150.0, knee_db=6.0, max_gr_db=4.0)
         log["glue_avg_gr_db"] = round(float(np.mean(gr)), 2)
 
-    # 4. stereo image: mono bass, slightly wider top
-    x = effects.stereo_image(x, sr, p.master_bass_mono_hz, p.master_width)
+    # 4. stereo image: mono bass, slightly wider top (or the profile's width per band)
+    x = effects.stereo_image(x, sr, p.master_bass_mono_hz, 1.0 if profile is not None else p.master_width)
+    if profile is not None:
+        # closed loop: re-measure after the compressors and correct what is left, the way a final
+        # mastering EQ is set - so the result really lands near the reference's tonal balance
+        g = np.array(profile["grid_hz"])
+        c = np.array(profile["curve_db"])
+        hi = min(16000.0, 0.95 * min(t["lossy_cutoff_hz"] for t in profile["tracks"]))
+        x, marks2 = _tonal_correction(x, sr, lambda f: np.interp(np.log2(np.maximum(f, 20.0)), np.log2(g), c),
+                                      0.85, 6.0, 30.0, hi, 1.0)
+        log["tonal_eq_pass2_db"] = marks2
+        w1 = match_width(x, sr, profile["side_mid_db"], strength=0.8, max_db=6.0)
+        w2 = match_width(x, sr, profile["side_mid_db"], strength=0.8, max_db=3.0)  # second, smaller step
+        log["width_match_db"] = {k: round(w1.get(k, 0.0) + w2.get(k, 0.0), 2) for k in set(w1) | set(w2)}
     return x
 
 

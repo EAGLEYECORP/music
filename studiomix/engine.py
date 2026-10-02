@@ -50,6 +50,7 @@ def run(
     stack_at: list[tuple[float, float]] | None = None,
     progress=None,
     deliver_extra: list[str] | None = None,
+    profile: dict | None = None,
 ) -> dict:
     t0 = time.time()
 
@@ -187,7 +188,7 @@ def run(
 
     # ---------------------------------------------------------------- master
     say("master: tonal balance, multiband + glue compression, stereo image")
-    pre = chains.master_chain(mix, sr, preset, log["master"], reference)
+    pre = chains.master_chain(mix, sr, preset, log["master"], reference, profile)
     stems = []
     if export_stems:
         stems = [("vocal_stem", lead_bus), ("instrumental_stem", inst)]
@@ -209,6 +210,7 @@ def master_mix(
     deliver_extra: list[str] | None = None,
     verbose: bool = True,
     progress=None,
+    profile: dict | None = None,
 ) -> dict:
     """Finished or rough stereo mix -> diagnosed, repaired, mastered and verified release files."""
     t0 = time.time()
@@ -245,7 +247,7 @@ def master_mix(
     x *= 10 ** ((-6.0 - analysis.sample_peak_db(x)) / 20)  # premaster level: peaks at -6 dBFS
 
     say("master: tonal balance, multiband + glue compression, stereo image")
-    pre = chains.master_chain(x, sr, preset, log["master"], reference)
+    pre = chains.master_chain(x, sr, preset, log["master"], reference, profile)
     return deliver(pre, x, sr, preset, name, out_dir, log, say, t0, ceiling_overridden, None, deliver_extra)
 
 
