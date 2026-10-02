@@ -59,12 +59,31 @@ computer. Expect a few minutes per song, and keep Termux open while it runs.
 
 **Auto-tune (pitch correction)**
 - **Finds the key automatically.** It reads the harmony of the beat (drums are filtered out first) and checks how well the singer's melody fits each candidate scale. If it isn't confident, it falls back to safe chromatic tuning and says so in the report. You can always set the key yourself with `--key "F# minor"`.
-- **Tracks the pitch** (the YIN algorithm) and picks each note with hysteresis, so a voice sitting between two notes doesn't warble back and forth.
+- **Tracks pitch robustly.** It uses probabilistic YIN (pYIN): every candidate pitch is weighed under a whole range of thresholds, then the most consistent path through time is chosen (Viterbi). This all but eliminates the octave jumps that make cheap auto-tune glitch. The analysis looks only below 1.2 kHz, so breath, rasp and "s" sounds don't confuse it, and loud frames count as evidence of singing, so breathy notes still get tuned.
+- **Decides notes using the whole phrase.** Because it works on the finished recording rather than live, it can look ahead: the sustained part of a note decides which note it is, so a scoop into a note or a fall at its end can't snap it to the wrong one. A real-time plug-in can't do this.
+- **Sub-sample accurate.** New pitch periods use the singer's exact (fractional) period and are placed with sub-sample precision. High voices land within about a cent instead of being off by a rounding error.
 - **Retune speed:** `0` ms is the instant, robotic snap (T-Pain / trap). 20–40 ms is modern pop. 80 ms and up is natural.
 - **Humanize:** keeps vibrato and expression on held notes while the note centre still lands in tune.
 - **Keeps the voice's natural tone.** It re-spaces the voice's own pitch cycles (PSOLA) instead of speeding the audio up or down, so there's no chipmunk effect. Parts that don't need correcting pass through bit-for-bit unchanged.
 - **Styles:** `--tune hard | pop | natural | off`
 - Scales: major, minor, harmonic-minor, major/minor-pentatonic, blues, chromatic
+
+**Measured, not guessed.** `python tools/bench_tune.py` renders synthetic singers whose true pitch
+is known: bass to C6, vibrato, scoops, drift, breathy and near-whisper delivery, and "s"/"sh"
+consonants. It then scores the tuner against a perfectly tuned render of the same performance.
+
+| (7 voices, hard tune)                 | first version | now |
+|---------------------------------------|------|------|
+| notes landing in tune (< 10 cents)    | 46%  | **95%** |
+| average note error                    | 328 cents | **1.25 cents** |
+| tracking errors (octave jumps etc.)   | 26%  | **0.3%** |
+| sung audio left untuned (missed)      | 40%  | **5%** |
+| breathy voice: notes correct          | 7%   | **100%** |
+| consonants wrongly treated as pitched | 5.8% | 7.6% |
+
+Known limits: near-whispered singing is still tracked only about 75% of the time. A singer more
+than about 45 cents off sits halfway between two notes, so it snaps to whichever scale note is
+nearer, which may not be the one they meant. Pass `--key` to rule out non-scale notes.
 
 **Lead vocal and ad-libs**
 1. Folds a stereo vocal to mono, then sets a fixed working level so every later stage behaves the same on every take

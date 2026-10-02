@@ -236,3 +236,15 @@ def test_runs_without_numba_pedalboard_or_soundfile(demo_files, tmp_path):
     log = json.loads((tmp_path / "t_report.json").read_text())
     assert log["output"]["integrated_lufs"] == pytest.approx(-8.5, abs=0.2)
     assert log["output"]["true_peak_dbtp"] <= -2.0 + 0.01
+
+
+@pytest.mark.parametrize("case", ["high", "breathy", "bass"])
+def test_tuner_benchmark_regression(case):
+    """Guards the measured accuracy of the tracker + note decisions + PSOLA (tools/bench_tune.py)."""
+    import bench_tune
+
+    spec = {c[0].split()[0]: c for c in bench_tune.CASES}[case]
+    r = bench_tune.run_case(*spec)
+    assert r["track_gross_%"] < 2.0
+    assert r["notes_ok_%"] >= 90.0
+    assert r["note_err_c"] < 3.0

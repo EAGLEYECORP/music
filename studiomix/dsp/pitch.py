@@ -47,79 +47,147 @@ def midi_to_hz(m):
 
 # ------------------------------------------------------------------ pitch tracking
 
-def yin(x: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 1100.0, hop: int | None = None,
-        threshold: float = 0.15):
-    """YIN f0 tracker. Returns (frame_times_s, f0_hz, aperiodicity, frame_rms_db, hop)."""
-    hop = hop or int(round(sr * 0.005))
+def _cmnd_candidates(x: np.ndarray, sr: int, fmin: float, fmax: float, hop: int, max_cands: int = 6):
+    """YIN cumulative-mean-normalised difference, reduced to its local-minimum candidates.
+
+    Returns per-frame arrays (nfr, max_cands) of candidate periods (samples, sub-sample precise)
+    and their CMND values, in increasing-period order, plus frame RMS (dB).
+    """
     W = int(2 ** np.ceil(np.log2(sr * 0.04)))  # ~40 ms analysis window
-    tau_max = min(W // 2, int(sr / fmin))
+    tau_max = min(W // 2 - 2, int(sr / fmin))
     tau_min = max(2, int(sr / fmax))
-    I = W - tau_max  # integration length
+    I = W - tau_max - 1  # integration length
     xp = np.pad(x, (W // 2, W // 2 + hop))
     frames = sliding_window_view(xp, W)[::hop]
     nfr = frames.shape[0]
     nfft = int(2 ** np.ceil(np.log2(W + I)))
-
-    f0 = np.zeros(nfr)
-    aper = np.ones(nfr)
+    cand_tau = np.full((nfr, max_cands), np.nan)
+    cand_val = np.full((nfr, max_cands), np.inf)
     rms = np.zeros(nfr)
-    taus = np.arange(tau_max + 1)
+    taus = np.arange(tau_max + 2)
     for s in range(0, nfr, 1024):
         fr = frames[s:s + 1024].astype(np.float64)
-        rms[s:s + len(fr)] = np.sqrt(np.mean(fr[:, W // 2 - hop: W // 2 + hop] ** 2, axis=1))
+        n = len(fr)
+        rms[s:s + n] = np.sqrt(np.mean(fr[:, W // 2 - hop: W // 2 + hop] ** 2, axis=1))
         A = np.fft.rfft(fr[:, :I], nfft)
         B = np.fft.rfft(fr, nfft)
-        corr = np.fft.irfft(np.conj(A) * B, nfft)[:, : tau_max + 1]
-        c = np.concatenate([np.zeros((len(fr), 1)), np.cumsum(fr * fr, axis=1)], axis=1)
-        e0 = c[:, I][:, None]
-        et = c[:, taus + I] - c[:, taus]
-        d = np.maximum(e0 + et - 2.0 * corr, 0.0)
+        corr = np.fft.irfft(np.conj(A) * B, nfft)[:, : tau_max + 2]
+        c = np.concatenate([np.zeros((n, 1)), np.cumsum(fr * fr, axis=1)], axis=1)
+        d = np.maximum(c[:, I][:, None] + (c[:, taus + I] - c[:, taus]) - 2.0 * corr, 0.0)
         d[:, 0] = 0.0
         cs = np.cumsum(d[:, 1:], axis=1)
         cmnd = np.ones_like(d)
         cmnd[:, 1:] = d[:, 1:] * taus[1:] / np.maximum(cs, 1e-12)
+        cmnd[cs[:, -1] < 1e-12, 1:] = 1.0  # digital silence
 
-        region = cmnd[:, tau_min:tau_max]
-        rows = np.arange(len(fr))
-        below = region < threshold
-        has = below.any(axis=1)
-        idx = np.where(has, np.argmax(below, axis=1), np.argmin(region, axis=1))
-        for _ in range(64):  # walk down to the bottom of the first dip
-            nxt = np.minimum(idx + 1, region.shape[1] - 1)
-            move = region[rows, nxt] < region[rows, idx]
-            if not move.any():
-                break
-            idx = np.where(move, nxt, idx)
-        a = region[rows, idx]
-        # parabolic interpolation around the minimum
-        t = idx + tau_min
-        l = cmnd[rows, np.maximum(t - 1, 1)]
-        r = cmnd[rows, np.minimum(t + 1, tau_max)]
-        den = l - 2 * cmnd[rows, t] + r
+        r = cmnd[:, tau_min - 1: tau_max + 2]
+        mid = r[:, 1:-1]
+        is_min = (mid < r[:, :-2]) & (mid <= r[:, 2:]) & (mid < 0.6)
+        rows, cols = np.nonzero(is_min)
+        first = np.searchsorted(rows, np.arange(n))
+        rank = np.arange(len(rows)) - first[rows]
+        keep = rank < max_cands
+        rows, cols, rank = rows[keep], cols[keep], rank[keep]
+        t = cols + tau_min
+        l, c0, rr = cmnd[rows, t - 1], cmnd[rows, t], cmnd[rows, t + 1]
+        den = l - 2 * c0 + rr
         with np.errstate(divide="ignore", invalid="ignore"):
-            shift = np.where(np.abs(den) > 1e-12, 0.5 * (l - r) / den, 0.0)
-        tt = t + np.clip(shift, -1, 1)
-        f0[s:s + len(fr)] = sr / tt
-        aper[s:s + len(fr)] = a
-    times = np.arange(nfr) * hop / sr
-    return times, f0, aper, 20.0 * np.log10(rms + 1e-12), hop
+            sh = np.where(np.abs(den) > 1e-12, 0.5 * (l - rr) / den, 0.0)
+        sh = np.clip(sh, -1, 1)
+        cand_tau[s + rows, rank] = t + sh
+        cand_val[s + rows, rank] = np.maximum(c0 - 0.25 * (l - rr) * sh, 0.0)
+    return cand_tau, cand_val, 20.0 * np.log10(rms + 1e-12)
+
+
+BETA_B = 8.0
+UV_LOUD_SCALE = 0.12  # how much a loud frame discounts the 'unvoiced' hypothesis  # threshold prior Beta(2, BETA_B): mean 2 / (2 + BETA_B)
+
+
+def _candidate_probs(cand_val: np.ndarray) -> np.ndarray:
+    """pYIN (Mauch & Dixon 2014): run YIN under a Beta(2, 18) distribution of thresholds; each
+    candidate's probability is the share of thresholds for which it is the *first* dip below
+    threshold. This favours the true period over its multiples (octave-down errors)."""
+    from scipy.special import betainc
+
+    cdf = lambda v: betainc(2.0, BETA_B, np.clip(v, 0.0, 1.0))  # noqa: E731
+    prefix = np.minimum.accumulate(cand_val, axis=1)
+    prev = np.concatenate([np.full((len(cand_val), 1), np.inf), prefix[:, :-1]], axis=1)
+    hi = np.where(np.isinf(prev), 1.0, cdf(np.where(np.isinf(prev), 1.0, prev)))
+    lo = cdf(np.where(np.isinf(cand_val), 1.0, cand_val))
+    return np.where(cand_val < prev, np.maximum(hi - lo, 0.0), 0.0)
+
+
+def _viterbi(cand_midi: np.ndarray, probs: np.ndarray, gate: np.ndarray, uv_scale: np.ndarray,
+             jump_cost: float = 0.5, switch_cost: float = 2.5) -> np.ndarray:
+    """Most likely path through (candidates + unvoiced) over time. Returns chosen index per frame
+    (K = unvoiced)."""
+    nfr, K = probs.shape
+    voiced_p = probs.sum(axis=1)
+    em = np.empty((nfr, K + 1))
+    em[:, :K] = -np.log(np.maximum(probs, 1e-9))
+    em[:, :K][~np.isfinite(cand_midi)] = np.inf
+    em[:, K] = -np.log(np.clip((1.0 - voiced_p) * uv_scale, 0.02, 1.0))
+    em[~gate, :K] = np.inf  # too quiet to be the singer
+    back = np.zeros((nfr, K + 1), dtype=np.int32)
+    cost = em[0].copy()
+    m_prev = cand_midi[0]
+    for i in range(1, nfr):
+        m = cand_midi[i]
+        trans = np.empty((K + 1, K + 1))  # [from, to]
+        with np.errstate(invalid="ignore"):
+            jump = np.abs(m_prev[:, None] - m[None, :]) * jump_cost
+        trans[:K, :K] = np.where(np.isfinite(jump), jump, np.inf)
+        trans[:K, K] = switch_cost
+        trans[K, :K] = switch_cost
+        trans[K, K] = 0.0
+        tot = cost[:, None] + trans
+        back[i] = np.argmin(tot, axis=0)
+        cost = tot[back[i], np.arange(K + 1)] + em[i]
+        m_prev = m
+    path = np.empty(nfr, dtype=np.int32)
+    path[-1] = int(np.argmin(cost))
+    for i in range(nfr - 1, 0, -1):
+        path[i - 1] = back[i, path[i]]
+    return path
+
+
+def yin(x: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 1100.0, hop: int | None = None):
+    """Probabilistic YIN f0 tracker with Viterbi smoothing.
+
+    Returns (frame_times_s, f0_hz (nan = unvoiced), aperiodicity, frame_rms_db, hop).
+    """
+    hop = hop or int(round(sr * 0.005))
+    # analyse below ~2.2 kHz: the fundamental and low harmonics carry the pitch, while breath,
+    # rasp and sibilance (which make YIN call voiced frames unvoiced) mostly live above
+    lp = signal.sosfiltfilt(signal.butter(4, 1200.0, fs=sr, output="sos"), x)
+    cand_tau, cand_val, rms_db = _cmnd_candidates(lp, sr, fmin, fmax, hop)
+    probs = _candidate_probs(cand_val)
+    cand_midi = np.where(np.isfinite(cand_tau), hz_to_midi(sr / np.where(np.isfinite(cand_tau), cand_tau, 1.0)),
+                         np.nan)
+    loud = np.percentile(rms_db, 98)
+    gate = (rms_db > loud - 45.0) & (rms_db > -75.0)
+    # on an isolated vocal, energy below 1.2 kHz is strong evidence of a sung vowel ("s"/"sh"
+    # consonants have almost none there): breathy-but-loud frames lean voiced
+    uv_scale = np.interp(rms_db - loud, [-30.0, -8.0], [1.0, UV_LOUD_SCALE])
+    path = _viterbi(cand_midi, probs, gate, uv_scale)
+    K = cand_tau.shape[1]
+    rows = np.arange(len(path))
+    voiced = path < K
+    pick = np.minimum(path, K - 1)
+    f0 = np.where(voiced, sr / np.where(voiced, cand_tau[rows, pick], 1.0), np.nan)
+    aper = np.where(voiced, cand_val[rows, pick], 1.0)
+    times = np.arange(len(path)) * hop / sr
+    return times, f0, aper, rms_db, hop
 
 
 def track(x: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 1100.0):
     """Pitch track with voicing decisions and cleanup. Returns dict of per-frame arrays."""
     times, f0, aper, rms_db, hop = yin(x, sr, fmin, fmax)
-    loud = np.percentile(rms_db, 98)
-    voiced = (aper < 0.25) & (rms_db > loud - 40.0) & (rms_db > -65.0)
-    midi = np.where(voiced, hz_to_midi(np.maximum(f0, 1.0)), np.nan)
-    # kill octave jumps / single-frame blips with a median filter on voiced frames
-    filled = np.where(voiced, midi, np.nanmedian(midi) if voiced.any() else 60.0)
-    med = median_filter(filled, size=7, mode="nearest")
-    jump = np.abs(filled - med) > 0.8
-    midi = np.where(voiced & ~jump, filled, np.where(voiced, med, np.nan))
+    voiced = np.isfinite(f0)
+    midi = np.where(voiced, hz_to_midi(np.where(voiced, f0, 1.0)), np.nan)
     # drop voiced islands shorter than 40 ms (usually consonant noise)
     min_len = int(0.04 * sr / hop)
-    v = voiced.astype(np.int8)
-    edges = np.flatnonzero(np.diff(np.concatenate([[0], v, [0]])))
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], voiced.astype(np.int8), [0]])))
     for a, b in zip(edges[::2], edges[1::2]):
         if b - a < min_len:
             voiced[a:b] = False
@@ -198,11 +266,26 @@ def key_name(tonic: int, scale: str) -> str:
 
 # ------------------------------------------------------------------ correction curve
 
-def _nearest_allowed(m: float, allowed: np.ndarray) -> int:
-    base = int(np.floor(m))
-    cands = np.arange(base - 2, base + 4)
-    cands = cands[np.isin(cands % 12, allowed)]
-    return int(cands[np.argmin(np.abs(cands - m))])
+def _note_path(m: np.ndarray, allowed: np.ndarray, sigma: float, switch_cost: float):
+    """Viterbi over the scale notes near a phrase. Returns (candidate notes, index per frame)."""
+    lo, hi = int(np.floor(np.min(m))) - 2, int(np.ceil(np.max(m))) + 2
+    notes = np.array([k for k in range(lo, hi + 1) if k % 12 in allowed], dtype=float)
+    em = (m[:, None] - notes[None, :]) ** 2 / (2 * sigma ** 2)
+    K = len(notes)
+    cost = em[0].copy()
+    back = np.zeros((len(m), K), dtype=np.int32)
+    for i in range(1, len(m)):
+        best_prev = int(np.argmin(cost))
+        stay = cost
+        switch = cost[best_prev] + switch_cost
+        use_switch = switch < stay
+        back[i] = np.where(use_switch, best_prev, np.arange(K))
+        cost = np.where(use_switch, switch, stay) + em[i]
+    path = np.empty(len(m), dtype=np.int32)
+    path[-1] = int(np.argmin(cost))
+    for i in range(len(m) - 1, 0, -1):
+        path[i - 1] = back[i, path[i]]
+    return notes, path
 
 
 def target_curve(trk: dict, sr: int, tonic: int, scale: str, retune_ms: float, humanize: float,
@@ -222,21 +305,19 @@ def target_curve(trk: dict, sr: int, tonic: int, scale: str, retune_ms: float, h
         seg = midi[s0:s1]
         smooth[s0:s1] = signal.filtfilt(b, a, seg, padlen=min(len(seg) - 1, 9)) if len(seg) > 10 else np.median(seg)
 
+    # note decisions: per voiced phrase, the most likely sequence of scale notes (Viterbi), using the
+    # whole phrase - so a scoop or a fall at the edge of a note can't choose the wrong note
     target = np.full(n, np.nan)
     since = np.zeros(n)
-    note, onset = None, 0
-    for i in range(n):
-        if not voiced[i]:
-            note = None
-            continue
-        m = smooth[i]
-        cand = _nearest_allowed(m, allowed)
-        if note is None:
-            note, onset = cand, i
-        elif cand != note and abs(m - note) > 0.5 + hysteresis:
-            note, onset = cand, i
-        target[i] = note
-        since[i] = (i - onset) * hop_s
+    for s0, s1 in zip(edges[::2], edges[1::2]):
+        notes, path = _note_path(smooth[s0:s1], allowed, sigma=0.5, switch_cost=8.0 + 4.0 * hysteresis)
+        seg_target = notes[path]
+        target[s0:s1] = seg_target
+        onset = 0
+        for j in range(s1 - s0):
+            if j > 0 and seg_target[j] != seg_target[j - 1]:
+                onset = j
+            since[s0 + j] = (j - onset) * hop_s
 
     tau = retune_ms / 1000.0
     decay = np.exp(-since / tau) if tau > 0 else np.zeros(n)
@@ -283,15 +364,27 @@ def _pitch_marks(x: np.ndarray, sr: int, f0_frames: np.ndarray, hop: int):
     return np.asarray(marks), np.asarray(periods)
 
 
+def _cubic(xp: np.ndarray, pos: np.ndarray) -> np.ndarray:
+    """Catmull-Rom interpolation of xp at fractional positions (exact at integer positions)."""
+    i = np.floor(pos).astype(np.int64)
+    mu = pos - i
+    p0, p1, p2, p3 = xp[i - 1], xp[i], xp[i + 1], xp[i + 2]
+    return p1 + 0.5 * mu * (p2 - p0 + mu * (2 * p0 - 5 * p1 + 4 * p2 - p3 + mu * (3 * (p1 - p2) + p3 - p0)))
+
+
 def psola(x: np.ndarray, sr: int, f0_frames: np.ndarray, ratio_frames: np.ndarray, hop: int) -> np.ndarray:
-    """Time-domain PSOLA pitch shift of a mono signal by a per-frame ratio (1 = unchanged)."""
+    """Time-domain PSOLA pitch shift of a mono signal by a per-frame ratio (1 = unchanged).
+
+    Synthesis grains are spaced by the singer's *exact* (fractional) period divided by the ratio
+    and placed with sub-sample precision, so the new pitch is exact even for high voices where a
+    one-sample rounding of the period would be tens of cents.
+    """
     n = len(x)
     marks, periods = _pitch_marks(x, sr, f0_frames, hop)
-    maxp = int(periods.max()) + 2
+    maxp = int(periods.max()) + 4
     xp = np.pad(x, (maxp, maxp))
     y = np.zeros(n + 2 * maxp)
     wsum = np.zeros(n + 2 * maxp)
-    windows: dict[int, np.ndarray] = {}
     nfr = len(ratio_frames)
     ts = float(marks[0])
     k = 0
@@ -300,18 +393,26 @@ def psola(x: np.ndarray, sr: int, f0_frames: np.ndarray, ratio_frames: np.ndarra
         while k + 1 < len(marks) and abs(marks[k + 1] - ts) <= abs(marks[k] - ts):
             k += 1
         m, P = int(marks[k]), int(periods[k])
-        w = windows.get(P)
-        if w is None:
-            w = windows[P] = signal.windows.hann(2 * P, sym=False)
-        t = int(round(ts))
-        y[t - P + maxp: t + P + maxp] += xp[m - P + maxp: m + P + maxp] * w
-        wsum[t - P + maxp: t + P + maxp] += w
-        r = ratio_frames[min(nfr - 1, t // hop)] if t >= 0 else 1.0
+        t0 = int(np.floor(ts))
+        frac = ts - t0
+        j = np.arange(t0 - P + 1, t0 + P + 1)          # output samples covered by this grain
+        u = j - ts                                      # position relative to the grain centre
+        w = 0.5 * (1.0 + np.cos(np.pi * u / P))         # continuous Hann, centred on ts
+        if frac == 0.0:
+            g = xp[m - P + 1 + maxp: m + P + 1 + maxp]
+        else:
+            g = _cubic(xp, m + u + maxp)
+        y[j + maxp] += g * w
+        wsum[j + maxp] += w
+        fi = min(nfr - 1, max(0, t0) // hop)
+        r = ratio_frames[fi]
         if abs(r - 1.0) < 1e-4 and k + 1 < len(marks):
             ts = float(marks[k + 1])  # nothing to shift: lock onto the analysis marks (bit-transparent)
             k += 1
         else:
-            ts += P / r
+            f = f0_frames[fi]
+            period = sr / f if np.isfinite(f) and f > 0 else float(P)
+            ts += period / r
     y = y[maxp: maxp + n]
     wsum = wsum[maxp: maxp + n]
     # grain coverage is always >= ~0.7 inside the signal (|shift| <= 3 semitones); only the very
