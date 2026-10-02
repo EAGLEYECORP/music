@@ -101,6 +101,13 @@ def _run_job(job: dict) -> None:
                                  reference_path=job.get("reference"), vocal_lift_db=o.get("vocal_lift", 0.0),
                                  deliver_extra=o.get("deliver"), verbose=False, progress=progress, profile=prof)
             else:
+                if job["mode"] == "studio":
+                    from . import studio
+
+                    progress("laying your takes on the beat's timeline")
+                    tr = studio.build_tracks(job["root"], job["session"])
+                    job["lead"], job["beat"] = tr["lead"], tr["beat"]
+                    job["adlibs"] = [tr["adlib"]] if "adlib" in tr else []
                 if o.get("key"):
                     pitch.parse_key(o["key"])
                 check_harmonies(o.get("harmonies"))
@@ -158,6 +165,21 @@ class Handler(BaseHTTPRequestHandler):
                 view = {k: job.get(k) for k in ("id", "status", "log", "error", "result", "name", "mode")}
                 view["out_dir"] = str(job["out"])
             return self._json(200, view)
+        m = re.fullmatch(r"/api/studio/([A-Za-z0-9_-]{1,40})", self.path)
+        if m:
+            from . import studio
+
+            return self._json(200, studio.info(self.jobs_dir, m.group(1)))
+        m = re.fullmatch(r"/studio/([A-Za-z0-9_-]{1,40})/(beat|take)(?:/([0-9a-f]{10}))?", self.path)
+        if m:
+            from . import studio
+
+            path = studio.file_path(self.jobs_dir, m.group(1), m.group(2), m.group(3))
+            if path is None or not path.exists():
+                return self._json(404, {"error": "no such file"})
+            ctype = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".flac": "audio/flac",
+                     ".m4a": "audio/mp4", ".aac": "audio/aac"}.get(path.suffix, "application/octet-stream")
+            return self._send(200, path.read_bytes(), ctype)
         m = re.fullmatch(r"/jobs/([0-9a-f]{12})/([^/]+)", self.path)
         if m:
             with _jobs_lock:
@@ -176,8 +198,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in ("/api/jobs", "/api/learn"):
+        st = re.fullmatch(r"/api/studio/([A-Za-z0-9_-]{1,40})/(beat|take|delete/([0-9a-f]{10}))", self.path)
+        if self.path not in ("/api/jobs", "/api/learn") and not st:
             return self._json(404, {"error": "not found"})
+        if st and st.group(3):
+            from . import studio
+
+            studio.delete_take(self.jobs_dir, st.group(1), st.group(3))
+            return self._json(200, studio.info(self.jobs_dir, st.group(1)))
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0 or length > MAX_UPLOAD:
             return self._json(413, {"error": "upload too large (max 1 GB)"})
@@ -186,6 +214,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "expected a form upload"})
         fields, files = _parse_multipart(ctype, self.rfile.read(length))
         f = lambda k, d="": (fields.get(k) or [d])[0].strip()  # noqa: E731
+        if st:
+            from . import studio
+
+            try:
+                if st.group(2) == "beat":
+                    if not files.get("beat"):
+                        return self._json(400, {"error": "choose a beat"})
+                    studio.save_beat(self.jobs_dir, st.group(1), *files["beat"][0])
+                else:
+                    if not files.get("take"):
+                        return self._json(400, {"error": "no audio received"})
+                    studio.add_take(self.jobs_dir, st.group(1), files["take"][0][1], f("role", "lead"),
+                                    float(f("offset_s", "0") or 0), float(f("latency_ms", "0") or 0))
+            except (ValueError, RuntimeError) as e:
+                return self._json(400, {"error": str(e)})
+            return self._json(200, studio.info(self.jobs_dir, st.group(1)))
         if self.path == "/api/learn":
             if not files.get("refs"):
                 return self._json(400, {"error": "choose one or more reference songs"})
@@ -210,7 +254,16 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=_run_job, args=(job,), daemon=True).start()
             return self._json(200, {"id": job_id})
 
-        mode = "mix" if f("mode") == "mix" else "stems"
+        mode = f("mode") if f("mode") in ("mix", "studio") else "stems"
+        if mode == "studio":
+            from . import studio
+
+            try:
+                info = studio.info(self.jobs_dir, f("session"))
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            if not info["beat"] or not any(t["role"] == "lead" for t in info["takes"]):
+                return self._json(400, {"error": "load a beat and record at least one lead take first"})
         if mode == "mix" and not files.get("mix"):
             return self._json(400, {"error": "choose your mix file"})
         if mode == "stems" and (not files.get("lead") or not files.get("beat")):
@@ -247,7 +300,7 @@ class Handler(BaseHTTPRequestHandler):
         preset = get_preset(preset_name, **overrides)
 
         job_id = uuid.uuid4().hex[:12]
-        first = files["mix" if mode == "mix" else "lead"][0][0]
+        first = f("session") if mode == "studio" else files["mix" if mode == "mix" else "lead"][0][0]
         name = re.sub(r"[^A-Za-z0-9._ -]+", "_", f("name") or Path(first).stem)[:60] or "song"
         out = self.jobs_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{name}"
         src = out / "inputs"
@@ -266,7 +319,9 @@ class Handler(BaseHTTPRequestHandler):
                         "profile": f("profile"), "lufs_set": bool(f("lufs"))},
             "started": time.time(),
         }
-        if mode == "mix":
+        if mode == "studio":
+            job["root"], job["session"] = self.jobs_dir, f("session")
+        elif mode == "mix":
             job["mix"] = save(files["mix"][0], "mix")
             if files.get("reference"):
                 job["reference"] = save(files["reference"][0], "reference")
@@ -400,10 +455,28 @@ audio { width: 100%; margin: 4px 0 12px; }
 .err { color: #ff6b6b; font-weight: 600; }
 button.small { margin-top: 10px; width: 100%; border: 1px solid var(--accent); background: transparent; color: var(--accent);
   border-radius: 12px; padding: 12px; font: 700 15px system-ui, sans-serif; cursor: pointer; }
-.modes { grid-template-columns: 1fr 1fr; margin-bottom: 14px; }
-.modes label { padding: 12px 0; font-size: 15px; }
-body.mode-mix .only-stems { display: none; }
-body:not(.mode-mix) .only-mix { display: none; }
+.modes { grid-template-columns: 1fr 1fr 1fr; margin-bottom: 14px; }
+.modes label { padding: 11px 0; font-size: 14px; }
+body[data-mode=mix] .m-vox, body[data-mode=mix] .m-stems, body[data-mode=mix] .m-rec,
+body[data-mode=stems] .m-mix, body[data-mode=stems] .m-rec,
+body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; }
+.rec { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+.recbtn { width: 76px; height: 76px; border-radius: 50%; border: 0; background: #e5322d; color: #fff;
+  font: 800 15px system-ui, sans-serif; flex: none; cursor: pointer; box-shadow: 0 0 0 4px rgba(229,50,45,.25); }
+.recbtn.on { animation: pulse 1s infinite; border-radius: 22px; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 10px rgba(229,50,45,.15); } }
+.meter { flex: 1; }
+.meter .lvl { height: 10px; background: var(--chip); border-radius: 999px; overflow: hidden; }
+.meter .lvl i { display: block; height: 100%; width: 0; background: var(--ok); transition: width 60ms; }
+.meter .lvl i.hot { background: #ff4d4d; }
+.meter .time { font: 700 26px ui-monospace, monospace; margin-top: 6px; font-variant-numeric: tabular-nums; }
+.takes { list-style: none; padding: 0; margin: 10px 0 0; }
+.takes li { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-top: 1px solid var(--line); font-size: 14px; }
+.takes li .grow { flex: 1; } .takes .warn { color: var(--warn); font-size: 12px; }
+.takes button, .mini { border: 1px solid var(--line); background: var(--chip); color: var(--text); border-radius: 10px;
+  padding: 8px 12px; font: 600 14px system-ui, sans-serif; cursor: pointer; }
+.tag { font-size: 11px; font-weight: 700; padding: 3px 7px; border-radius: 6px; background: var(--chip); text-transform: uppercase; }
+.tag.lead { background: var(--accent); color: var(--accent-ink); }
 #diag { margin: 0 0 12px; padding-left: 18px; font-size: 14px; }
 #diag li { margin: 4px 0; }
 .muted { color: var(--muted); font-size: 13px; }
@@ -415,11 +488,43 @@ body:not(.mode-mix) .only-mix { display: none; }
 
 <form id="f">
 <div class="seg modes">
-  <input type="radio" name="mode" id="m1" value="stems" checked><label for="m1">🎤 Vocal + beat</label>
+  <input type="radio" name="mode" id="m0" value="studio"><label for="m0">🎙️ Record</label>
+  <input type="radio" name="mode" id="m1" value="stems" checked><label for="m1">🎤 Upload vocals</label>
   <input type="radio" name="mode" id="m2" value="mix"><label for="m2">🎚️ Finished mix</label>
 </div>
 
-<section class="only-mix">
+<section class="m-rec" id="studio">
+  <h2>Studio</h2>
+  <div class="row"><div class="stack"><div class="lbl">Song</div>
+    <input type="text" id="session" placeholder="Song name, e.g. night-drive" autocomplete="off"></div></div>
+  <label class="file"><input type="file" id="studiobeat" accept="audio/*,.wav,.mp3,.flac,.m4a">
+    <div class="icon">🥁</div><div><div class="t">Beat</div><div class="s" id="beatname">Tap to choose (saved with the song)</div></div></label>
+  <div class="row"><div class="stack"><div class="lbl">Microphone</div><select id="micsel"><option value="">Default microphone</option></select>
+    <div class="hint">Best: the phone's own mic or wired earbuds. Bluetooth earbuds: fine for listening, poor as a mic.</div></div></div>
+  <div class="row"><div><div class="lbl">Earbud delay <b id="latval">0 ms</b></div>
+    <div class="hint">Calibrate once per pair of earbuds: hold an earbud against the phone's mic, tap Calibrate.</div></div>
+    <button type="button" class="mini" id="calib">Calibrate</button></div>
+  <div class="row"><div class="stack"><div class="lbl">Recording</div>
+    <div class="seg" style="grid-template-columns:1fr 1fr">
+      <input type="radio" name="role" id="r1" value="lead" checked><label for="r1">Lead</label>
+      <input type="radio" name="role" id="r2" value="adlib"><label for="r2">Ad-lib</label>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <input type="text" id="startat" value="0:00" style="width:110px" aria-label="start at">
+      <div class="hint" style="align-self:center">start at (the beat starts 3 s before, so you hear the lead-in)</div>
+    </div>
+    <div class="rec">
+      <button type="button" class="recbtn" id="recbtn">REC</button>
+      <div class="meter"><div class="lvl"><i id="lvl"></i></div><div class="time" id="rectime">0:00.0</div>
+        <div class="hint" id="rechint">Earbuds in, tap REC, perform, tap STOP.</div></div>
+    </div>
+    <label style="display:flex;gap:8px;align-items:center;margin-top:8px" class="hint">Beat volume
+      <input type="range" id="beatvol" min="0" max="1" step="0.05" value="0.8" style="flex:1"></label>
+  </div></div>
+  <ul class="takes" id="takes"></ul>
+</section>
+
+<section class="m-mix">
   <h2>Your mix</h2>
   <label class="file"><input type="file" name="mix" accept="audio/*,.wav,.mp3,.flac,.m4a">
     <div class="icon">🎚️</div><div><div class="t">Rough / finished mix</div><div class="s">Tap to choose · one stereo file, WAV best</div></div></label>
@@ -430,7 +535,7 @@ body:not(.mode-mix) .only-mix { display: none; }
   <p class="muted" style="margin:6px 2px 0">It checks for clipping, phase, mud, harshness and silence, fixes what it can, then masters. Auto-tune needs the separate vocal (use "Vocal + beat").</p>
 </section>
 
-<section class="only-stems">
+<section class="m-stems">
   <h2>Tracks</h2>
   <label class="file" data-for="lead"><input type="file" name="lead" accept="audio/*,.wav,.mp3,.flac,.m4a" required>
     <div class="icon">🎤</div><div><div class="t">Lead vocal</div><div class="s">Tap to choose · dry, no effects</div></div></label>
@@ -447,22 +552,22 @@ body:not(.mode-mix) .only-mix { display: none; }
   <div class="row"><div class="stack"><div class="lbl">Sound like <span class="muted">(your reference library)</span></div>
     <select name="profile" id="profsel"><option value="">— no reference profile —</option>{{PROFILES}}</select>
     <div class="hint">Matches loudness, tonal balance and stereo width of the songs you taught it</div></div></div>
-  <div class="row only-stems"><div class="stack"><div class="lbl">Auto-tune</div>
+  <div class="row m-vox"><div class="stack"><div class="lbl">Auto-tune</div>
     <div class="seg">
       <input type="radio" name="tune" id="t0" value="off"><label for="t0">Off</label>
       <input type="radio" name="tune" id="t1" value="natural"><label for="t1">Natural</label>
       <input type="radio" name="tune" id="t2" value="" checked><label for="t2">Style</label>
       <input type="radio" name="tune" id="t3" value="hard"><label for="t3">Hard</label>
     </div><div class="hint">"Style" uses the preset's own setting · Hard = instant robotic snap</div></div></div>
-  <div class="row only-stems"><div class="stack"><div class="lbl">Key</div>
+  <div class="row m-vox"><div class="stack"><div class="lbl">Key</div>
     <input type="text" name="key" placeholder="Auto-detect (or e.g. F# minor)" autocomplete="off"></div></div>
-  <div class="row only-stems"><div><div class="lbl">Song changes key</div><div class="hint">Detect a key per section</div></div>
+  <div class="row m-vox"><div><div class="lbl">Song changes key</div><div class="hint">Detect a key per section</div></div>
     <label class="switch"><input type="checkbox" name="key_changes"><span></span></label></div>
-  <div class="row only-stems"><div><div class="lbl">Flex-Tune</div><div class="hint">Keep intentional bends & runs natural</div></div>
+  <div class="row m-vox"><div><div class="lbl">Flex-Tune</div><div class="hint">Keep intentional bends & runs natural</div></div>
     <label class="switch"><input type="checkbox" id="flexon"><span></span></label></div>
 </section>
 
-<section class="only-stems">
+<section class="m-vox">
   <h2>Vocal stack</h2>
   <div class="row"><div><div class="lbl">Doubles</div><div class="hint">Two thick double-tracks, wide</div></div>
     <label class="switch"><input type="checkbox" name="doubles"><span></span></label></div>
@@ -493,7 +598,7 @@ body:not(.mode-mix) .only-mix { display: none; }
   <details><summary>More options</summary>
     <div class="row"><div class="stack"><div class="lbl">Song name</div><input type="text" name="name" placeholder="From the vocal file name"></div></div>
     <div class="row"><div class="stack"><div class="lbl">Loudness (LUFS)</div><input type="number" name="lufs" step="0.5" placeholder="Preset default (e.g. -9 trap, -14 streaming)"></div></div>
-    <div class="row only-stems"><div class="stack"><div class="lbl">Vocal level vs beat (dB)</div><input type="number" name="vocal_level" step="0.5" placeholder="Preset default"></div></div>
+    <div class="row m-vox"><div class="stack"><div class="lbl">Vocal level vs beat (dB)</div><input type="number" name="vocal_level" step="0.5" placeholder="Preset default"></div></div>
   </details>
 </section>
 </form>
@@ -566,15 +671,207 @@ $("#lf").addEventListener("submit", async e => {
   btn.disabled = false; btn.textContent = "Learn this sound";
 });
 function setMode() {
-  const mix = document.querySelector("input[name=mode]:checked").value === "mix";
-  document.body.classList.toggle("mode-mix", mix);
-  document.querySelector("input[name=mix]").required = mix;
-  document.querySelector("input[name=lead]").required = !mix;
-  document.querySelector("input[name=beat]").required = !mix;
+  const mode = document.querySelector("input[name=mode]:checked").value;
+  document.body.dataset.mode = mode;
+  try { localStorage.setItem("sm_mode", mode); } catch (_) {}
+  document.querySelector("input[name=mix]").required = mode === "mix";
+  document.querySelector("input[name=lead]").required = mode === "stems";
+  document.querySelector("input[name=beat]").required = mode === "stems";
 }
+try { const m = localStorage.getItem("sm_mode"); if (m) document.querySelector(`input[name=mode][value=${m}]`).checked = true; } catch (_) {}
 document.querySelectorAll("input[name=mode]").forEach(r => r.addEventListener("change", setMode));
 setMode();
 const STEPS_EST = 9;
+const Studio = (() => {
+  let ctx = null, beatBuf = null, beatFor = null, stream = null, recording = null, info = null;
+  const ls = (k, d) => { try { return localStorage.getItem(k) ?? d; } catch (_) { return d; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} };
+  let latencyMs = +ls("sm_latency", "0");
+  const session = () => ($("#session").value || "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  const fmt = t => { t = Math.max(0, t); return Math.floor(t / 60) + ":" + (t % 60).toFixed(1).padStart(4, "0"); };
+  const parseT = v => { v = (v || "0").trim(); if (v.includes(":")) { const [m, s] = v.split(":"); return (+m) * 60 + (+s || 0); } return +v || 0; };
+  const WORKLET = `class Rec extends AudioWorkletProcessor {
+    constructor() { super(); this.buf = []; this.n = 0; this.start = 0; }
+    process(inputs) {
+      const ch = inputs[0] && inputs[0][0];
+      if (ch) { if (!this.n) this.start = currentFrame; this.buf.push(ch.slice(0)); this.n += ch.length;
+        if (this.n >= 4096) { this.port.postMessage({f: this.start, d: this.buf}); this.buf = []; this.n = 0; } }
+      return true; } }
+  registerProcessor("rec", Rec);`;
+  async function audio() {
+    if (!ctx) {
+      ctx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: "interactive"});
+      await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], {type: "application/javascript"})));
+    }
+    if (ctx.state === "suspended") await ctx.resume();
+    return ctx;
+  }
+  async function mic() {
+    const dev = $("#micsel").value;
+    if (stream && stream._dev === dev) return stream;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    // raw voice: phones' call processing (echo cancel, noise suppression, auto gain) damages vocals
+    stream = await navigator.mediaDevices.getUserMedia({audio: {deviceId: dev ? {exact: dev} : undefined,
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1}});
+    stream._dev = dev;
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput");
+    const sel = $("#micsel"), keep = sel.value;
+    sel.innerHTML = '<option value="">Default microphone</option>' + devs.map((d, i) =>
+      `<option value="${d.deviceId}">${(d.label || "Microphone " + (i + 1)).replace(/</g, "")}</option>`).join("");
+    sel.value = keep;
+    return stream;
+  }
+  // capture: returns {stop(): Float32Array of samples, firstFrame}
+  async function capture(onLevel) {
+    const c = await audio(), s = await mic();
+    const src = c.createMediaStreamSource(s), node = new AudioWorkletNode(c, "rec"), sink = c.createGain();
+    sink.gain.value = 0; src.connect(node); node.connect(sink); sink.connect(c.destination);
+    const chunks = []; let first = null;
+    node.port.onmessage = e => {
+      if (first === null) first = e.data.f;
+      let pk = 0; for (const b of e.data.d) { chunks.push(b); for (let i = 0; i < b.length; i += 4) pk = Math.max(pk, Math.abs(b[i])); }
+      onLevel && onLevel(pk);
+    };
+    return { stop() {
+      src.disconnect(); node.disconnect(); sink.disconnect();
+      const n = chunks.reduce((a, b) => a + b.length, 0), out = new Float32Array(n);
+      let o = 0; for (const b of chunks) { out.set(b, o); o += b.length; }
+      return {data: out, first: first ?? 0};
+    } };
+  }
+  function wav(data, sr) {  // 32-bit float mono WAV: no quality loss, keeps headroom
+    const buf = new ArrayBuffer(44 + data.length * 4), v = new DataView(buf);
+    const w = (o, str) => [...str].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
+    w(0, "RIFF"); v.setUint32(4, 36 + data.length * 4, true); w(8, "WAVE"); w(12, "fmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 3, true); v.setUint16(22, 1, true); v.setUint32(24, sr, true);
+    v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 32, true); w(36, "data");
+    v.setUint32(40, data.length * 4, true); new Float32Array(buf, 44).set(data);
+    return new Blob([buf], {type: "audio/wav"});
+  }
+  async function loadBeat() {
+    const s_ = session(); if (!s_ || !info || !info.beat) return null;
+    if (beatBuf && beatFor === s_ + info.beat.name) return beatBuf;
+    const c = await audio(), raw = await (await fetch(`/studio/${s_}/beat`)).arrayBuffer();
+    beatBuf = await c.decodeAudioData(raw); beatFor = s_ + info.beat.name; return beatBuf;
+  }
+  function render() {
+    $("#latval").textContent = Math.round(latencyMs) + " ms";
+    $("#beatname").textContent = info && info.beat ? `${info.beat.name} · ${fmt(info.beat.duration_s)}` : "Tap to choose (saved with the song)";
+    $("#studiobeat").closest("label").classList.toggle("has", !!(info && info.beat));
+    const ul = $("#takes"); ul.innerHTML = "";
+    ((info && info.takes) || []).slice().sort((a, b) => a.offset_s - b.offset_s).forEach(t => {
+      const li = document.createElement("li");
+      li.innerHTML = `<span class="tag ${t.role}">${t.role === "lead" ? "Lead" : "Ad-lib"}</span>
+        <div class="grow"><div>${fmt(t.offset_s)} → ${fmt(t.offset_s + t.duration_s)}</div>
+        ${t.warning ? `<div class="warn">${t.warning}</div>` : ""}</div>
+        <button type="button" data-play="${t.id}">▶</button><button type="button" data-del="${t.id}">🗑</button>`;
+      ul.appendChild(li);
+    });
+    if (!ul.children.length) ul.innerHTML = '<li class="muted">No takes yet</li>';
+  }
+  async function refresh() {
+    const s_ = session(); if (!s_) { info = null; render(); return; }
+    lsSet("sm_session", $("#session").value);
+    info = await (await fetch(`/api/studio/${s_}`)).json(); render();
+  }
+  let playing = [];
+  function stopPlay() { playing.forEach(n => { try { n.stop(); } catch (_) {} }); playing = []; }
+  async function playTake(id) {
+    stopPlay(); const t = info.takes.find(x => x.id === id), c = await audio(), beat = await loadBeat();
+    const tb = await c.decodeAudioData(await (await fetch(`/studio/${session()}/take/${id}`)).arrayBuffer());
+    const when = c.currentTime + 0.1, pre = Math.min(2, t.offset_s);
+    const g = c.createGain(); g.gain.value = +$("#beatvol").value; g.connect(c.destination);
+    if (beat) { const b = c.createBufferSource(); b.buffer = beat; b.connect(g); b.start(when, t.offset_s - pre); playing.push(b); }
+    const v = c.createBufferSource(); v.buffer = tb; v.connect(c.destination); v.start(when + pre); playing.push(v);
+  }
+  async function record() {
+    const btn = $("#recbtn");
+    if (recording) {  // STOP
+      const r = recording; recording = null; btn.classList.remove("on"); btn.textContent = "REC";
+      r.src.stop(); clearInterval(r.timer);
+      const {data, first} = r.cap.stop();
+      // beat position p was heard at context time t0 + (p - playFrom); the voice answering it
+      // reaches the recorder `latency` later. Keep the audio from the take's start position on.
+      const startFrame = Math.round((r.t0 + (r.startAt - r.playFrom) + latencyMs / 1000) * r.sr) - first;
+      const take = startFrame >= 0 ? data.subarray(startFrame) : data;
+      if (take.length < r.sr * 0.3) { $("#rechint").textContent = "Too short - nothing saved."; return; }
+      $("#rechint").textContent = "Saving take…";
+      const fd = new FormData();
+      fd.append("take", wav(take, r.sr), "take.wav"); fd.append("role", r.role);
+      fd.append("offset_s", r.startAt.toFixed(3)); fd.append("latency_ms", latencyMs);
+      const res = await fetch(`/api/studio/${session()}/take`, {method: "POST", body: fd});
+      const j = await res.json(); if (!res.ok) { $("#rechint").textContent = j.error; return; }
+      info = j; render(); const last = j.takes[j.takes.length - 1];
+      $("#rechint").textContent = last.warning ? "Saved - " + last.warning : "Saved. Tap ▶ to hear it with the beat.";
+      return;
+    }
+    if (!session()) { alert("Give the song a name first"); return; }
+    stopPlay();
+    try {
+      const c = await audio(), beat = await loadBeat();
+      if (!beat) { alert("Choose a beat first"); return; }
+      const startAt = parseT($("#startat").value), playFrom = Math.max(0, startAt - 3);
+      let peakHold = 0;
+      const cap = await capture(pk => { peakHold = Math.max(pk, peakHold * 0.8);
+        const el = $("#lvl"); el.style.width = Math.min(100, peakHold * 100) + "%"; el.classList.toggle("hot", pk > 0.95); });
+      const g = c.createGain(); g.gain.value = +$("#beatvol").value; g.connect(c.destination);
+      const src = c.createBufferSource(); src.buffer = beat; src.connect(g);
+      const t0 = c.currentTime + 0.2; src.start(t0, playFrom);
+      const role = document.querySelector("input[name=role]:checked").value;
+      const timer = setInterval(() => { $("#rectime").textContent = fmt(playFrom + c.currentTime - t0); }, 100);
+      recording = {cap, src, t0, startAt, playFrom, sr: c.sampleRate, role, timer};
+      src.onended = () => { if (recording) record(); };
+      btn.classList.add("on"); btn.textContent = "STOP";
+      $("#rechint").textContent = startAt > playFrom ? `Lead-in… your part starts at ${fmt(startAt)}` : "Recording…";
+    } catch (err) { alert("Microphone not available: " + err.message); }
+  }
+  async function calibrate() {
+    if (recording) return;
+    const b = $("#calib"); b.disabled = true; b.textContent = "Listening…";
+    try {
+      const c = await audio(), sr = c.sampleRate, n = 8, gap = 0.8;
+      const cap = await capture(null);
+      const click = c.createBuffer(1, Math.round(sr * 0.004), sr), d = click.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.sin(2 * Math.PI * 2000 * i / sr) * (1 - i / d.length);
+      const t0 = c.currentTime + 0.4;
+      for (let k = 0; k < n; k++) { const s_ = c.createBufferSource(); s_.buffer = click; s_.connect(c.destination); s_.start(t0 + k * gap); }
+      await new Promise(r => setTimeout(r, (0.4 + n * gap + 0.6) * 1000));
+      const {data, first} = cap.stop();
+      let mx = 0; for (let i = 0; i < data.length; i++) mx = Math.max(mx, Math.abs(data[i]));
+      const thr = mx * 0.35, lats = [];
+      for (let k = 0; k < n; k++) {
+        const a = Math.round((t0 + k * gap) * sr) - first, e = a + Math.round(gap * 0.9 * sr);
+        for (let i = Math.max(0, a); i < Math.min(e, data.length); i++) if (Math.abs(data[i]) > thr) { lats.push((i - a) / sr * 1000); break; }
+      }
+      lats.sort((x, y) => x - y);
+      const med = lats[Math.floor(lats.length / 2)], spread = lats.length ? lats[lats.length - 1] - lats[0] : 999;
+      if (mx < 0.01 || lats.length < 5 || spread > 15) {
+        alert("Couldn't hear the clicks clearly. Hold one earbud right on the phone's microphone, turn the volume up, and try again in a quiet room.");
+      } else { latencyMs = med; lsSet("sm_latency", String(med)); render(); }
+    } catch (err) { alert("Microphone not available: " + err.message); }
+    b.disabled = false; b.textContent = "Calibrate";
+  }
+  $("#session").value = ls("sm_session", "");
+  $("#session").addEventListener("change", refresh);
+  $("#studiobeat").addEventListener("change", async e => {
+    if (!session()) { alert("Give the song a name first"); e.target.value = ""; return; }
+    const fd = new FormData(); fd.append("beat", e.target.files[0]);
+    $("#beatname").textContent = "Uploading…";
+    const res = await fetch(`/api/studio/${session()}/beat`, {method: "POST", body: fd}); const j = await res.json();
+    if (!res.ok) { alert(j.error); } else { info = j; beatBuf = null; render(); }
+  });
+  $("#recbtn").addEventListener("click", record);
+  $("#calib").addEventListener("click", calibrate);
+  $("#latval").addEventListener("click", () => { const v = prompt("Earbud delay in ms", Math.round(latencyMs));
+    if (v !== null && !isNaN(+v)) { latencyMs = +v; lsSet("sm_latency", String(latencyMs)); render(); } });
+  $("#takes").addEventListener("click", async e => {
+    const p = e.target.dataset.play, d = e.target.dataset.del;
+    if (p) playTake(p);
+    if (d && confirm("Delete this take?")) { info = await (await fetch(`/api/studio/${session()}/delete/${d}`, {method: "POST"})).json(); render(); }
+  });
+  refresh();
+  return {session, refresh};
+})();
 
 document.querySelectorAll("label.file input").forEach(inp => inp.addEventListener("change", () => {
   const lab = inp.closest("label"), s = lab.querySelector(".s");
@@ -587,6 +884,10 @@ $("#f").addEventListener("submit", e => {
   e.preventDefault();
   const fd = new FormData($("#f"));
   if ($("#flexon").checked) fd.set("flex", "35");
+  if (document.body.dataset.mode === "studio") {
+    if (!Studio.session()) { alert("Give the song a name first"); return; }
+    fd.set("session", Studio.session()); fd.delete("lead"); fd.delete("beat"); fd.delete("adlibs");
+  }
   $("#go").disabled = true; $("#go").textContent = "Working…";
   $("#result").style.display = "none"; $("#progress").style.display = "block";
   $("#steps").innerHTML = ""; $("#ptitle").textContent = "Uploading"; $("#pbar").style.width = "0";

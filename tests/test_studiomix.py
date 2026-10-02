@@ -570,3 +570,46 @@ def test_width_matching_reaches_targets():
         assert side_mid_db(y, sr, *map(float, k.split("-"))) == pytest.approx(t, abs=1.0)
     # the low end is never widened
     assert side_mid_db(y, sr, 20, 110) == pytest.approx(side_mid_db(x, sr, 20, 110), abs=0.1)
+
+
+# ------------------------------------------------------------------ phone studio
+
+
+def test_studio_session_builds_timeline(tmp_path, demo_files):
+    from studiomix import studio
+
+    def wav_bytes(x, sr=48000):
+        p = tmp_path / "tmp.wav"
+        audio_io.write_wav(p, x, sr, 32)
+        return p.read_bytes()
+
+    beat = (demo_files / "b.wav").read_bytes()
+    studio.save_beat(tmp_path, "Night Drive", "beat.wav", beat)
+    tone = np.sin(2 * np.pi * 220 * np.arange(48000) / 48000)[None, :] * 0.3
+    t1 = studio.add_take(tmp_path, "night-drive", wav_bytes(tone), "lead", 1.0, 180.0)
+    studio.add_take(tmp_path, "night-drive", wav_bytes(tone * 0.5), "lead", 4.0, 180.0)
+    studio.add_take(tmp_path, "night-drive", wav_bytes(tone), "adlib", 2.5, 180.0)
+    loud = studio.add_take(tmp_path, "night-drive", wav_bytes(np.clip(tone * 5, -1, 1)), "adlib", 6.0, 0)
+    assert "clipped" in loud["warning"]
+    studio.delete_take(tmp_path, "night-drive", loud["id"])
+    info = studio.info(tmp_path, "night-drive")
+    assert info["beat"]["name"] == "beat.wav" and len(info["takes"]) == 3
+
+    tr = studio.build_tracks(tmp_path, "night-drive")
+    lead, sr = audio_io.load(tr["lead"])
+    env = lambda a, b: np.max(np.abs(lead[0, int(a * sr):int(b * sr)]))  # noqa: E731
+    assert env(0.0, 0.95) < 1e-6 and env(1.05, 1.95) > 0.25 and env(2.05, 3.95) < 1e-6 and env(4.05, 4.95) > 0.1
+    ad, _ = audio_io.load(tr["adlib"])
+    assert np.max(np.abs(ad[0, : int(2.45 * sr)])) < 1e-6
+    with pytest.raises(ValueError):
+        studio.add_take(tmp_path, "night-drive", wav_bytes(tone), "drums", 0, 0)
+    with pytest.raises(ValueError):
+        studio.safe_session("!!!")
+    assert t1["latency_ms"] == 180.0
+
+
+def test_studio_requires_beat_and_lead(tmp_path):
+    from studiomix import studio
+
+    with pytest.raises(ValueError):
+        studio.build_tracks(tmp_path, "empty-song")

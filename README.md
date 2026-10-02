@@ -120,6 +120,38 @@ studiomix vocal.wav beat.wav -a adlibs.wav -p trap -o master
 The finished files appear in your phone's **Downloads/master** folder. A phone is slower than a
 computer. Expect a few minutes per song, and keep Termux open while it runs.
 
+### Phone studio: record with earbuds
+
+In the app, choose **🎙️ Record**:
+
+1. Name the song and pick the beat. Both are saved on the phone, so you can come back later.
+2. **Calibrate once per pair of earbuds:** hold an earbud against the phone's mic and tap
+   *Calibrate*. It plays clicks and measures the exact delay of that output (Bluetooth earbuds
+   are often 150–300 ms late). Every take is shifted by that amount, so it sits exactly where
+   you heard the beat.
+3. Choose **Lead** or **Ad-lib**, set *start at* (to punch in a verse or hook; you hear 3 s of
+   beat before it), tap **REC**, perform, tap **STOP**. Each take is saved as uncompressed
+   audio the moment you stop, with a warning if it clipped or is too quiet. ▶ plays it back
+   against the beat; 🗑 deletes it.
+4. Tap **Mix & master**: your takes are laid on the beat's timeline and go through auto-tune,
+   harmonies, doubles, the mix and the verified master.
+
+The recorder captures the raw mic: the phone's call processing (echo cancellation, noise
+suppression, auto-gain) is switched off, because it damages vocals.
+
+**Earbuds and mics: what actually works**
+
+- **Listening:** any earbuds. With Bluetooth, calibrate (step 2).
+- **Recording:** the **phone's own microphone** is usually the best mic you have. Hold the phone
+  like a mic, about a hand-width from your mouth, a bit off to the side to avoid pops. Wired
+  earbuds with a mic are OK.
+- **Avoid Bluetooth earbud mics.** When an app records through them, Bluetooth switches to
+  phone-call mode: narrow, muffled sound. On many phones the beat in your ears also drops to
+  call quality while you record. If that happens, use wired earbuds, or pick the phone's
+  microphone in the *Microphone* list.
+- Record in a small room with soft things around (clothes, a bed, curtains). Room echo can't
+  be removed later; noise between phrases can be, and it is.
+
 ### The app (no typing)
 
 ```bash
