@@ -257,8 +257,9 @@ def test_tracker_is_time_aligned_on_fast_slides():
     x = sung(pitch.midi_to_hz(midi_true))
     trk = pitch.track(x, SR)
     i = (trk["times"] > 0.55) & (trk["times"] < 0.95) & trk["voiced"]
-    truth = np.interp(trk["times"][i], t, midi_true)
-    assert np.median(np.abs(trk["midi"][i] - truth)) * 100 < 8.0
+    lags = np.arange(-10, 10.5, 0.5) / 1000
+    err = [np.median(np.abs(trk["midi"][i] - np.interp(trk["times"][i] + lag, t, midi_true))) for lag in lags]
+    assert abs(lags[int(np.argmin(err))]) <= 0.0015
 
 
 def test_short_onset_notes_are_merged():

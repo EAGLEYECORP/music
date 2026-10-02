@@ -54,7 +54,7 @@ def references(x: np.ndarray, t: np.ndarray):
     import parselmouth
 
     y = librosa.resample(x, orig_sr=SR, target_sr=22050)
-    f0, vflag, _ = librosa.pyin(y, fmin=65, fmax=1100, sr=22050, frame_length=2048, hop_length=256)
+    f0, vflag, _ = librosa.pyin(y, fmin=50, fmax=1100, sr=22050, frame_length=2048, hop_length=256)
     tl = librosa.times_like(f0, sr=22050, hop_length=256)
     lp = np.interp(t, tl, np.where(vflag, pitch.hz_to_midi(np.nan_to_num(f0, nan=1)), np.nan), left=np.nan, right=np.nan)
     lpv = np.interp(t, tl, vflag.astype(float)) > 0.5
@@ -67,7 +67,7 @@ def references(x: np.ndarray, t: np.ndarray):
 def praat(x: np.ndarray):
     import parselmouth
 
-    pp = parselmouth.Sound(x, sampling_frequency=SR).to_pitch(time_step=0.005, pitch_floor=65, pitch_ceiling=1100)
+    pp = parselmouth.Sound(x, sampling_frequency=SR).to_pitch(time_step=0.005, pitch_floor=50, pitch_ceiling=1100)
     f = pp.selected_array["frequency"]
     return pp.xs(), np.where(f > 0, pitch.hz_to_midi(np.maximum(f, 1)), np.nan)
 

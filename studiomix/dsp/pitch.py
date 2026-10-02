@@ -154,7 +154,7 @@ def _viterbi(cand_midi: np.ndarray, probs: np.ndarray, gate: np.ndarray, uv_scal
     return path
 
 
-def yin(x: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 1100.0, hop: int | None = None):
+def yin(x: np.ndarray, sr: int, fmin: float = 50.0, fmax: float = 1100.0, hop: int | None = None):
     """Probabilistic YIN f0 tracker with Viterbi smoothing.
 
     Returns (frame_times_s, f0_hz (nan = unvoiced), aperiodicity, frame_rms_db, hop).
@@ -196,9 +196,23 @@ def yin(x: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 1100.0, hop: i
     return times, f0, aper, rms_db, hop
 
 
-def track(x: np.ndarray, sr: int, fmin: float = 65.0, fmax: float = 1100.0):
-    """Pitch track with voicing decisions and cleanup. Returns dict of per-frame arrays."""
+def track(x: np.ndarray, sr: int, fmin: float = 50.0, fmax: float = 1100.0, adapt: bool = True):
+    """Pitch track with voicing decisions and cleanup. Returns dict of per-frame arrays.
+
+    With `adapt`, a first pass over the full range (50-1100 Hz) learns the singer's register,
+    then the final pass searches 1.3 octaves below to 1.7 octaves above their median pitch.
+    Deep voices keep the low range; higher voices don't pick up fake low "pitches" in breath.
+    """
     times, f0, aper, rms_db, hop = yin(x, sr, fmin, fmax)
+    if adapt:
+        v = np.isfinite(f0)
+        if v.sum() > 0.25 * sr / hop:  # at least ~0.25 s of pitched audio
+            med = float(np.median(f0[v]))  # robust: stray low/high frames can't drag it
+            lo, hi = med / 2.5, med * 3.2   # 1.3 octaves below, 1.7 above the typical pitch
+            new_min = max(fmin, lo)
+            new_max = min(fmax, max(hi, 2 * new_min + 1))
+            if new_min > fmin * 1.15 or new_max < fmax / 1.15:
+                times, f0, aper, rms_db, hop = yin(x, sr, new_min, new_max)
     voiced = np.isfinite(f0)
     midi = np.where(voiced, hz_to_midi(np.where(voiced, f0, 1.0)), np.nan)
     # drop voiced islands shorter than 40 ms (usually consonant noise)
@@ -441,13 +455,13 @@ def psola(x: np.ndarray, sr: int, f0_frames: np.ndarray, ratio_frames: np.ndarra
         j = np.arange(t0 - P + 1, t0 + P + 1)          # output samples covered by this grain
         u = j - ts                                      # position relative to the grain centre
         w = 0.5 * (1.0 + np.cos(np.pi * u / P))         # continuous Hann, centred on ts
+        fi = min(nfr - 1, max(0, t0) // hop)
         if frac == 0.0:
             g = xp[m - P + 1 + maxp: m + P + 1 + maxp]
         else:
             g = _cubic(xp, m + u + maxp)
         y[j + maxp] += g * w
         wsum[j + maxp] += w
-        fi = min(nfr - 1, max(0, t0) // hop)
         r = ratio_frames[fi]
         if abs(r - 1.0) < 1e-4 and k + 1 < len(marks):
             ts = float(marks[k + 1])  # nothing to shift: lock onto the analysis marks (bit-transparent)

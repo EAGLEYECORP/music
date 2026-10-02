@@ -196,6 +196,8 @@ def run_case(name: str, base_midi: float, breath: float, seed: int) -> dict:
 
 
 CASES = [
+    ("deep  (E2-ish)", 40.0, 0.05, 8),
+    ("deep breathy", 40.0, 0.15, 9),
     ("bass  (A2-ish)", 45.0, 0.05, 1),
     ("tenor (A3-ish)", 57.0, 0.05, 2),
     ("alto  (E4-ish)", 64.0, 0.08, 3),
