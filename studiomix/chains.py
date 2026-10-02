@@ -360,27 +360,52 @@ def repair_mix(x: np.ndarray, sr: int, p: Preset, diag: dict, vocal_lift_db: flo
 
 # ------------------------------------------------------------------ master
 
-def match_width(x: np.ndarray, sr: int, targets: dict, strength: float = 0.7, max_db: float = 4.0) -> dict:
-    """Nudge the side (stereo) level of each band toward a profile's side/mid ratio, in place.
-    Bands below 120 Hz are never touched: the low end stays mono."""
+def match_width(x: np.ndarray, sr: int, targets: dict, strength: float = 0.8, max_db: float = 6.0,
+                passes: int = 3) -> dict:
+    """Move each band's side (stereo) level toward a profile's side/mid ratio, in place.
+
+    Gains are applied to the side signal with a linear-phase FIR (exact band gains, no phase
+    fighting), re-measured after every pass. Below 120 Hz nothing changes - the low end stays mono -
+    and a band that is nearly mono (side < -18 dB) is widened by at most 6 dB in total: boosting the
+    side of mono material only amplifies leftovers and sounds phasey.
+    """
     from .profiles import side_mid_db
 
-    mid = 0.5 * (x[0] + x[1])
-    side = 0.5 * (x[0] - x[1])
-    applied = {}
+    bands = []
     for key, target in targets.items():
         a, b = (float(v) for v in key.split("-"))
-        if a < 120 or b > sr * 0.45:
-            continue
-        cur = side_mid_db(np.vstack([mid + side, mid - side]), sr, a, b)
-        g_db = float(np.clip((target - cur) * strength, -max_db, max_db))
-        if abs(g_db) < 0.2:
-            continue
-        band = filters.bandpass(side[None, :], sr, a, b, order=2)[0]
-        side = side + (10 ** (g_db / 20) - 1.0) * band
-        applied[key] = round(g_db, 2)
+        if a >= 120 and b <= sr * 0.45:
+            bands.append((key, a, b, float(target)))
+    if not bands:
+        return {}
+    mid = 0.5 * (x[0] + x[1])
+    side = 0.5 * (x[0] - x[1])
+    total = {k: 0.0 for k, *_ in bands}
+    start = {k: side_mid_db(x, sr, a, b) for k, a, b, _ in bands}
+    for _ in range(passes):
+        cur_x = np.vstack([mid + side, mid - side])
+        pts_f, pts_g = [20.0, 112.0], [0.0, 0.0]
+        moved = False
+        for k, a, b, target in bands:
+            cur = side_mid_db(cur_x, sr, a, b)
+            g = (target - cur) * strength
+            lim = 6.0 if start[k] < -18.0 else max_db + 3.0
+            g = float(np.clip(total[k] + g, -(max_db + 3.0), lim) - total[k])
+            if abs(g) >= 0.2:
+                moved = True
+            total[k] += g
+            # flat across the band (short transitions at the edges), so the whole band gets it
+            pts_f += [a * 1.06, b / 1.06]
+            pts_g += [g, g]
+        if not moved:
+            break
+        pts_f.append(sr / 2)
+        pts_g.append(pts_g[-1])
+        freqs = np.linspace(0, sr / 2, 4097)
+        curve = np.interp(np.log2(np.maximum(freqs, 20.0)), np.log2(pts_f), pts_g)
+        side = filters.apply_fir(side[None, :], filters.match_eq_fir(freqs, curve, sr, 2049))[0]
     x[0], x[1] = mid + side, mid - side
-    return applied
+    return {k: round(v, 2) for k, v in total.items() if abs(v) >= 0.2}
 
 
 def master_chain(mix: np.ndarray, sr: int, p: Preset, log: dict, reference: np.ndarray | None = None,
@@ -444,9 +469,7 @@ def master_chain(mix: np.ndarray, sr: int, p: Preset, log: dict, reference: np.n
         x, marks2 = _tonal_correction(x, sr, lambda f: np.interp(np.log2(np.maximum(f, 20.0)), np.log2(g), c),
                                       0.85, 6.0, 30.0, hi, 1.0)
         log["tonal_eq_pass2_db"] = marks2
-        w1 = match_width(x, sr, profile["side_mid_db"], strength=0.8, max_db=6.0)
-        w2 = match_width(x, sr, profile["side_mid_db"], strength=0.8, max_db=3.0)  # second, smaller step
-        log["width_match_db"] = {k: round(w1.get(k, 0.0) + w2.get(k, 0.0), 2) for k in set(w1) | set(w2)}
+        log["width_match_db"] = match_width(x, sr, profile["side_mid_db"])
     return x
 
 

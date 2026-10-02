@@ -45,20 +45,46 @@ def _band(x: np.ndarray, sr: int, a: float, b: float) -> np.ndarray:
     return filters.bandpass(x, sr, a, min(b, sr * 0.45), order=2)
 
 
+PROFILE_VERSION = 2
+
+
 def side_mid_db(x: np.ndarray, sr: int, a: float, b: float) -> float:
-    y = _band(x, sr, a, b)
-    mid, side = 0.5 * (y[0] + y[1]), 0.5 * (y[0] - y[1])
-    return float(10 * np.log10((np.mean(side ** 2) + 1e-20) / (np.mean(mid ** 2) + 1e-20)))
+    """Side-to-mid energy ratio (dB) strictly inside [a, b) Hz, measured in the frequency domain
+    (a time-domain band-pass lets loud bass leak in and hides the band's real width)."""
+    from scipy import signal as _sig
+
+    mid, side = 0.5 * (x[0] + x[1]), 0.5 * (x[0] - x[1])
+    n = int(min(8192, 2 ** int(np.log2(max(len(mid), 256)))))
+    f, pm = _sig.welch(mid, sr, nperseg=n)
+    _, ps = _sig.welch(side, sr, nperseg=n)
+    sel = (f >= a) & (f < b)
+    return float(10 * np.log10((ps[sel].sum() + 1e-20) / (pm[sel].sum() + 1e-20)))
+
+
+def song_body(x: np.ndarray, sr: int, drop_lu: float = 12.0) -> tuple[int, int]:
+    """Sample range of the song itself: skips video intros/outros, skits and silence - everything
+    before the first and after the last moment the music is within `drop_lu` of its loud parts."""
+    st = analysis.short_term_lufs(x, sr, 3.0, 1.0)
+    if len(st) < 8:
+        return 0, x.shape[-1]
+    loud = np.percentile(st, 90)
+    idx = np.flatnonzero(st > loud - drop_lu)
+    a = int(idx[0]) * sr
+    b = min(x.shape[-1], (int(idx[-1]) + 3) * sr)
+    return a, b
 
 
 def analyse(path) -> dict:
-    """Measure one reference track."""
+    """Measure one reference track (only the song body - intros/outros of videos are skipped)."""
     x, sr0 = audio_io.load(path)
     sr = audio_io.working_rate(sr0)
     x = audio_io.resample(x, sr0, sr)
     if x.shape[0] == 1:
         x = np.vstack([x, x])
     x = x[:2]
+    total = x.shape[-1] / sr
+    a, b = song_body(x, sr)
+    x = x[:, a:b]
     m = analysis.measure(x, sr)
     f, db = filters.ltas_db(np.mean(x, axis=0), sr)
     db = filters.fractional_octave_smooth(f, db, 1 / 3)
@@ -74,6 +100,8 @@ def analyse(path) -> dict:
     lo = filters.lowpass(x, sr, 120.0, order=4)
     return {
         "file": Path(path).name,
+        "analysed": f"{int(a / sr) // 60}:{int(a / sr) % 60:02d}-{int(b / sr) // 60}:{int(b / sr) % 60:02d}"
+                    f" of {int(total) // 60}:{int(total) % 60:02d}",
         "integrated_lufs": m["integrated_lufs"],
         "true_peak_dbtp": m["true_peak_dbtp"],
         "loudness_range_lu": m["loudness_range_lu"],
@@ -124,7 +152,7 @@ def summarise(name: str, tracks: list[dict]) -> dict:
     widths = {k: float(np.median([t["side_mid_db"][k] for t in tracks])) for k in tracks[0]["side_mid_db"]}
     return {
         "name": name,
-        "version": 1,
+        "version": PROFILE_VERSION,
         "updated": time.strftime("%Y-%m-%d %H:%M"),
         "tracks": tracks,
         "target_lufs": round(float(np.median([t["integrated_lufs"] for t in tracks])), 2),
@@ -141,7 +169,11 @@ def load(name: str) -> dict:
     if not p.exists():
         avail = ", ".join(list_profiles()) or "none yet - create one with: studiomix learn REFS... --name NAME"
         raise KeyError(f"no profile '{name}' (available: {avail})")
-    return json.loads(p.read_text())
+    prof = json.loads(p.read_text())
+    if prof.get("version", 1) < PROFILE_VERSION:
+        raise KeyError(f"profile '{name}' was made by an older studiomix - run `studiomix learn` again "
+                       "with the same songs to update it")
+    return prof
 
 
 def list_profiles() -> list[str]:
@@ -173,5 +205,6 @@ def describe(prof: dict) -> str:
                  + "  ".join(f"{lbl} {np.interp(f_, g, rel):+.1f}" for f_, lbl in marks))
     for t in prof["tracks"]:
         lines.append(f"   - {t['file'][:40]:40s} {t['integrated_lufs']:6.2f} LUFS  {t['true_peak_dbtp']:+5.2f} dBTP  "
-                     f"LRA {t['loudness_range_lu']:4.1f}  {t['key']}  {t['tempo_bpm']} BPM  cutoff {t['lossy_cutoff_hz']} Hz")
+                     f"LRA {t['loudness_range_lu']:4.1f}  {t['key']}  {t['tempo_bpm']} BPM  cutoff {t['lossy_cutoff_hz']} Hz"
+                     + (f"  (analysed {t['analysed']})" if t.get("analysed") else ""))
     return "\n".join(lines)

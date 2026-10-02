@@ -542,3 +542,31 @@ def test_profile_errors(tmp_path, monkeypatch):
         profiles.load("nope")
     with pytest.raises(ValueError):
         profiles._safe("!!!")
+
+
+def test_song_body_skips_video_intro_and_outro():
+    from studiomix import profiles
+
+    sr = 48000
+    rng = np.random.default_rng(0)
+    intro = rng.standard_normal((2, sr * 20)) * 0.002          # quiet talking/ambience
+    song = rng.standard_normal((2, sr * 60)) * 0.2
+    outro = np.zeros((2, sr * 25))
+    a, b = profiles.song_body(np.concatenate([intro, song, outro], axis=1), sr)
+    assert abs(a / sr - 20) <= 3 and abs(b / sr - 80) <= 4
+
+
+def test_width_matching_reaches_targets():
+    from studiomix.profiles import side_mid_db
+
+    sr = 48000
+    rng = np.random.default_rng(1)
+    common = rng.standard_normal(sr * 10)
+    x = np.vstack([common + 0.3 * rng.standard_normal(sr * 10), common + 0.3 * rng.standard_normal(sr * 10)]) * 0.1
+    targets = {"500-2000": -6.0, "2000-8000": -12.0, "8000-16000": -20.0}
+    y = x.copy()
+    chains.match_width(y, sr, targets)
+    for k, t in targets.items():
+        assert side_mid_db(y, sr, *map(float, k.split("-"))) == pytest.approx(t, abs=1.0)
+    # the low end is never widened
+    assert side_mid_db(y, sr, 20, 110) == pytest.approx(side_mid_db(x, sr, 20, 110), abs=0.1)
