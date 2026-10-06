@@ -723,13 +723,13 @@ def test_studio_rejects_bad_uploads_and_edits(tmp_path, demo_files):
     good = (demo_files / "b.wav").read_bytes()
     studio.save_beat(tmp_path, "s", "beat.wav", good)
     # a broken beat upload must not destroy the beat already there
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         studio.save_beat(tmp_path, "s", "beat.mp3", b"not audio at all")
     d = studio.session_dir(tmp_path, "s")
     assert (d / "beat.wav").exists() and not list(d.glob("upload.*"))
     assert studio.info(tmp_path, "s")["beat"]["name"] == "beat.wav"
     # a broken take leaves no file behind
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         studio.add_take(tmp_path, "s", b"RIFFjunk", "lead", 0, 0)
     assert not list((d / "takes").glob("*.wav"))
     # NaN edits are refused (they would corrupt the session file for the browser)

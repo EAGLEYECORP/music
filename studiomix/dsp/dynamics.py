@@ -286,10 +286,10 @@ def limit(x: np.ndarray, sr: int, ceiling_db: float = -1.0, lookahead_ms: float 
     g = uniform_filter1d(g, width, mode="nearest")
     g_db = release_follow(20.0 * np.log10(np.maximum(g, EPS)), sr, release_ms)
     y = x * db_to_lin(g_db)[None, :]
-    # safety net for residual inter-sample overs created by the gain modulation itself
-    for _ in range(3):
-        tp = true_peak_db(y, oversample)
-        if tp <= ceiling_db:
-            break
+    # safety net for residual inter-sample overs created by the gain modulation itself. True peak
+    # is homogeneous in gain (oversampling and peak refinement are linear), so one exact trim
+    # lands it 0.01 dB under the ceiling - no need to measure again.
+    tp = true_peak_db(y, oversample)
+    if tp > ceiling_db:
         y *= 10.0 ** ((ceiling_db - tp - 0.01) / 20.0)
     return y, g_db

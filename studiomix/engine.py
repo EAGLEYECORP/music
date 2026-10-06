@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -124,6 +126,7 @@ def run(
     say("lead vocal: cleanup, auto-tune, auto-EQ, compression, de-essing, saturation")
     capture: dict = {}
     vocal, active = chains.vocal_chain(v, sr, preset, log["vocal"], tune_key, "vocal", trk, capture)
+    del v, trk  # (a 4-minute song is ~150 MB per stereo copy: on a phone every copy counts)
 
     stack = None
     if preset.doubles or preset.harmonies:
@@ -134,6 +137,7 @@ def run(
             capture = {"trk": t_, "out_midi": t_["midi"], "key": None}
         log["stack"] = {}
         stack = chains.build_stack(vocal, sr, capture, preset, active, stack_at, log["stack"])
+    del capture
 
     ad_dry = []
     ap = adlib_preset(preset)
@@ -144,11 +148,14 @@ def run(
         dry = chains.pan_phrases(dry, sr, act, preset.adlib_pan, start_left=(i % 2 == 0))
         ad_dry.append(dry)
         log["adlibs"].append(alog)
+        adl[i] = x = dry = act = None
+    del adl
 
     # ---------------------------------------------------------------- instrumental
     say("instrumental: subsonic filter, vocal-keyed presence carve")
     key_sig = vocal if not ad_dry else effects.to_stereo(vocal) + 0.5 * sum(ad_dry)
     inst = chains.instrumental_chain(b, key_sig, sr, active, preset, log["instrumental"])
+    del b, key_sig
     inst = inst * 10 ** ((-18.0 - analysis.integrated_lufs(inst, sr)) / 20)  # common gain staging
 
     # ---------------------------------------------------------------- balance + ride
@@ -157,46 +164,67 @@ def run(
     tempo = analysis.estimate_tempo(inst, sr)
     log["instrumental"]["tempo_bpm"] = round(tempo, 1) if tempo else None
     lead_bus = chains.vocal_effects(vocal, sr, preset, tempo, log["vocal"])
+    del vocal
     i_lufs = analysis.integrated_lufs(inst, sr)
     lead_target = i_lufs + preset.vocal_balance_db
     lead_gain = 10 ** ((lead_target - analysis.integrated_lufs(lead_bus, sr)) / 20)
     lead_bus = lead_bus * lead_gain
     log["vocal"]["balance_lu_vs_inst"] = preset.vocal_balance_db
 
-    if stack is not None:
+    has_stack = stack is not None
+    if has_stack:
         # same gain as the lead, wetter (stacks sit behind the lead in the space)
         sp = replace(preset, vocal_reverb=preset.vocal_reverb * 1.5 + 0.04, vocal_delay=preset.vocal_delay * 0.5)
         stack_bus = chains.vocal_effects(stack, sr, sp, tempo, {}) * lead_gain
+        del stack
     else:
         stack_bus = np.zeros_like(lead_bus)
 
     adlib_bus = np.zeros_like(lead_bus)
-    for dry, alog in zip(ad_dry, log["adlibs"]):
-        bus = chains.vocal_effects(dry, sr, ap, tempo, alog)
+    has_adlibs = bool(ad_dry)
+    for i, alog in enumerate(log["adlibs"]):
+        bus = chains.vocal_effects(ad_dry[i], sr, ap, tempo, alog)
+        ad_dry[i] = None
         adlib_bus += bus * 10 ** ((lead_target + preset.adlib_level_db - analysis.integrated_lufs(bus, sr)) / 20)
         alog["level_lu_vs_lead"] = preset.adlib_level_db
-    vocal_bus = lead_bus + stack_bus + adlib_bus
+        del bus
+    del ad_dry
 
-    mix = inst + vocal_bus
-    headroom = -6.0 - analysis.sample_peak_db(mix)  # classic premaster: peaks at -6 dBFS
-    mix *= 10 ** (headroom / 20)
-    vocal_bus *= 10 ** (headroom / 20)
-    lead_bus *= 10 ** (headroom / 20)
-    adlib_bus *= 10 ** (headroom / 20)
-    stack_bus *= 10 ** (headroom / 20)
-    inst *= 10 ** (headroom / 20)
+    mix = inst + lead_bus
+    mix += stack_bus
+    mix += adlib_bus
+    headroom = 10 ** ((-6.0 - analysis.sample_peak_db(mix)) / 20)  # classic premaster: peaks at -6 dBFS
+    mix *= headroom
+    # the stems and the premaster are only needed again when they are written out: park them on
+    # disk (memory-mapped) so a phone has that RAM free for mastering
+    spill = Path(tempfile.mkdtemp(prefix=".studiomix-", dir=out_dir))
+    try:
+        stems = []
+        if export_stems:
+            for stem_name, bus_, keep in [("vocal_stem", lead_bus, True), ("stack_stem", stack_bus, has_stack),
+                                          ("adlib_stem", adlib_bus, has_adlibs), ("instrumental_stem", inst, True)]:
+                if keep:
+                    bus_ *= headroom
+                    stems.append((stem_name, _park(bus_, spill / f"{stem_name}.npy")))
+        lead_bus = adlib_bus = stack_bus = inst = bus_ = None
 
-    # ---------------------------------------------------------------- master
-    say("master: tonal balance, multiband + glue compression, stereo image")
-    pre = chains.master_chain(mix, sr, preset, log["master"], reference, profile)
-    stems = []
-    if export_stems:
-        stems = [("vocal_stem", lead_bus), ("instrumental_stem", inst)]
-        if ad_dry:
-            stems.insert(1, ("adlib_stem", adlib_bus))
-        if stack is not None:
-            stems.insert(1, ("stack_stem", stack_bus))
-    return deliver(pre, mix, sr, preset, name, out_dir, log, say, t0, ceiling_overridden, stems, deliver_extra)
+        # ---------------------------------------------------------------- master
+        say("master: tonal balance, multiband + glue compression, stereo image")
+        pre = chains.master_chain(mix, sr, preset, log["master"], reference, profile)
+        premaster = _park(mix, spill / "premaster.npy")
+        del mix
+        return deliver(pre, premaster, sr, preset, name, out_dir, log, say, t0, ceiling_overridden, stems,
+                       deliver_extra)
+    finally:
+        stems = premaster = None
+        shutil.rmtree(spill, ignore_errors=True)
+
+
+def _park(x: np.ndarray, path: Path) -> np.ndarray:
+    """Move a song-length array to disk and return a read-only memory map of it (float32 keeps
+    full 24-bit resolution at half the size)."""
+    np.save(path, x.astype(np.float32))
+    return np.load(path, mmap_mode="r")
 
 
 def master_mix(

@@ -118,7 +118,9 @@ studiomix vocal.wav beat.wav -a adlibs.wav -p trap -o master
 ```
 
 The finished files appear in your phone's **Downloads/master** folder. A phone is slower than a
-computer. Expect a few minutes per song, and keep Termux open while it runs.
+computer. Expect a few minutes per song, and keep Termux open while it runs. Memory is kept
+low on purpose: a full 3.5-minute song with ad-libs, doubles, harmonies and a broadcast version
+peaks under 2 GB of RAM, so it runs on any recent phone.
 
 ### Phone studio: record with earbuds
 
@@ -169,7 +171,9 @@ lead, beat and ad-libs with the normal file picker, choose the style, auto-tune,
 doubles, then tap **Mix & master**. You can follow the progress, listen to the result, and
 download every file. Songs are also saved to **Downloads/studiomix**. The app only accepts
 connections from the phone itself. `studiomix serve --host 0.0.0.0` lets a laptop on the same Wi-Fi
-use it too. On a computer, the same command opens your normal browser.
+use it too. On a computer, the same command opens your normal browser. Other websites open in
+the same browser can't use it behind your back: requests from other sites, and from look-alike
+host names (DNS rebinding), are refused.
 
 ## What it does
 

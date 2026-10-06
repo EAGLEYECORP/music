@@ -553,6 +553,8 @@ def _pitch_marks(x: np.ndarray, sr: int, f0_frames: np.ndarray, hop: int):
 
 def _cubic(xp: np.ndarray, pos: np.ndarray) -> np.ndarray:
     """Catmull-Rom interpolation of xp at fractional positions (exact at integer positions)."""
+    if len(pos) > 1 << 18:  # whole-song delay lines: in chunks, not a dozen song-length temporaries
+        return np.concatenate([_cubic(xp, pos[a:a + (1 << 18)]) for a in range(0, len(pos), 1 << 18)])
     i = np.floor(pos).astype(np.int64)
     mu = pos - i
     p0, p1, p2, p3 = xp[i - 1], xp[i], xp[i + 1], xp[i + 2]

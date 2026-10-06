@@ -446,11 +446,21 @@ def master_chain(mix: np.ndarray, sr: int, p: Preset, log: dict, reference: np.n
 
     # 2. multiband compression: tames boomy lows / harsh highs independently, keeps tone
     if p.master_mb_amount > 0:
-        bands = filters.three_band_split(x, sr, 120.0, 4000.0)
         settings = [(0.8, 25.0, 160.0), (0.5, 12.0, 110.0), (0.8, 5.0, 70.0)]
         out = np.zeros_like(x)
         mb_log = []
-        for band, (r, att, rel) in zip(bands, settings):
+
+        def bands():  # filters.three_band_split, one band at a time (a phone holds 3 fewer copies)
+            low, rest = filters.lr4_split(x, sr, 120.0)
+            yield filters.lr4_allpass(low, sr, 4000.0)
+            del low
+            mid, high = filters.lr4_split(rest, sr, 4000.0)
+            del rest
+            yield mid
+            del mid
+            yield high
+
+        for band, (r, att, rel) in zip(bands(), settings):
             det = dynamics.detector_db(band, sr, "rms", 10.0)
             thr = float(np.percentile(det, 85))
             y, gr = dynamics.compress(band, sr, thr, 1 + 2 * r * p.master_mb_amount, att, rel,
@@ -458,6 +468,7 @@ def master_chain(mix: np.ndarray, sr: int, p: Preset, log: dict, reference: np.n
             y *= np.sqrt(np.mean(band ** 2) / (np.mean(y ** 2) + EPS))  # keep the band's average level
             out += y
             mb_log.append(round(float(np.mean(gr)), 2))
+            del band, y, gr, det
         x = out
         log["multiband_avg_gr_db"] = dict(zip(["low", "mid", "high"], mb_log))
 
@@ -516,6 +527,7 @@ def finalize_loudness(x: np.ndarray, sr: int, target_lufs: float, ceiling_dbtp: 
     g0 = start_gain_db if start_gain_db is not None else target_lufs - analysis.integrated_lufs(x, sr)
     y, gr, l0 = render(g0)
     keep((l0, g0, y, gr))
+    del y, gr
     g1 = g0 + (aim - l0) * 1.3  # limiting eats part of every boost
     for _ in range(6):
         if best_above is not None and best_above[0] - target_lufs <= 0.15:
@@ -523,10 +535,17 @@ def finalize_loudness(x: np.ndarray, sr: int, target_lufs: float, ceiling_dbtp: 
         y, gr, l1 = render(g1)
         keep((l1, g1, y, gr))
         del y, gr
+        if best_above is not None and best_below is not None:
+            # bracketed: interpolate between the closest renders on either side (a secant through
+            # two nearby points can see a tiny slope and leap far past the target)
+            (la, ga), (lb, gb) = best_above[:2], best_below[:2]
+            frac = float(np.clip((aim - lb) / max(la - lb, 1e-6), 0.1, 0.9))
+            g0, l0, g1 = g1, l1, gb + frac * (ga - gb)
+            continue
         slope = (l1 - l0) / (g1 - g0) if abs(g1 - g0) > 1e-6 else 1.0
-        slope = float(np.clip(slope, 0.1, 1.0))
+        slope = float(np.clip(slope, 0.25, 1.0))
         g0, l0 = g1, l1
-        g1 = g1 + (aim - l1) / slope
+        g1 = g1 + float(np.clip((aim - l1) / slope, -6.0, 6.0))
     lufs, gain, y, gr = best_above if best_above is not None else best_below
     if lufs > target_lufs:
         y = _gain(y, target_lufs - lufs)  # final exact trim (down only)
