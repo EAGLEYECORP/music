@@ -46,10 +46,29 @@ def _save_meta(d: Path, meta: dict) -> None:
     tmp.replace(d / "session.json")
 
 
+def _beat_key(x: np.ndarray, sr: int) -> dict:
+    """The beat's key, for live auto-tune while recording (the final mix re-detects it with the
+    sung melody too). Unsure -> chromatic: snapping to the nearest semitone is always safe."""
+    from .dsp import pitch
+
+    tonic, mode, conf = pitch.detect_key(pitch.chroma(x, sr))
+    sure = conf >= 0.5
+    return {"key": pitch.key_name(tonic, mode) if sure else "chromatic", "tonic": int(tonic),
+            "scale": mode if sure else "chromatic", "key_confidence": round(float(conf), 2)}
+
+
 def info(root: Path, session: str) -> dict:
     d = session_dir(root, session)
     with _lock:
         meta = _meta(d)
+    beat = meta["beat"]
+    if beat and "scale" not in beat and (d / beat["file"]).exists():  # beat saved by an older version
+        x, sr = audio_io.load(d / beat["file"])
+        with _lock:
+            meta = _meta(d)
+            if meta["beat"]:
+                meta["beat"].update(_beat_key(x, sr))
+                _save_meta(d, meta)
     return {"session": d.name, "beat": meta["beat"], "takes": meta["takes"]}
 
 
@@ -71,7 +90,8 @@ def save_beat(root: Path, session: str, filename: str, data: bytes) -> dict:
     tmp.replace(path)
     with _lock:
         meta = _meta(d)
-        meta["beat"] = {"file": path.name, "name": Path(filename).name, "duration_s": round(x.shape[-1] / sr, 2)}
+        meta["beat"] = {"file": path.name, "name": Path(filename).name, "duration_s": round(x.shape[-1] / sr, 2),
+                        **_beat_key(x, sr)}
         _save_meta(d, meta)
     return meta["beat"]
 

@@ -387,6 +387,8 @@ def _key_at(key, t_s: float) -> tuple[int, str]:
 def parse_key(text: str) -> tuple[int, str]:
     """'F# minor', 'Bbm', 'c major', 'A min', 'Eb' -> (pitch class, scale)."""
     t = text.strip()
+    if t.lower() in ("chromatic", "any", "none"):  # no key: nearest semitone
+        return 0, "chromatic"
     m = re.match(r"^([A-Ga-g])([#b]?)\s*(.*)$", t)
     if not m:
         raise ValueError(f"can't read key '{text}' (try e.g. 'F# minor' or 'Bb major')")

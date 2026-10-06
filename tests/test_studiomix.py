@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -753,3 +754,49 @@ def test_preset_overrides_out_of_range_are_refused():
     with pytest.raises(ValueError):
         get_preset("pop", target_lufs=-50.0)
     assert get_preset("pop", target_lufs=-9.0, ceiling_dbtp=-1.0).target_lufs == -9.0
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node.js to run the browser tuner code")
+def test_live_monitor_tuner_snaps_to_key(tmp_path):
+    """The earbud auto-tune (browser AudioWorklet code) lands on the key's notes, run headless."""
+    from studiomix.web import TUNE_JS
+
+    (tmp_path / "core.js").write_text(TUNE_JS + "\nmodule.exports = {TuneCore};")
+    (tmp_path / "t.js").write_text(r"""
+const {TuneCore} = require(process.argv[2]); const sr = 48000;
+function run(f, tonic, scale, hard) {
+  const n = sr * 1.5, x = new Float32Array(n), y = new Float32Array(n); let ph = 0;
+  for (let i = 0; i < n; i++) { ph += 2 * Math.PI * f / sr; let s = 0;
+    for (let h = 1; h <= 20 && h * f < 8000; h++) s += Math.sin(h * ph) / h; x[i] = 0.2 * s; }
+  const t = new TuneCore(sr); t.setKey(tonic, scale); t.enabled = hard !== null; if (hard) t.speed = hard;
+  for (let i = 0; i + 128 <= n; i += 128) t.process(x.subarray(i, i + 128), y.subarray(i, i + 128));
+  const a = sr, b = a + 4800, r = tau => { let s = 0, e1 = 0, e2 = 0;
+    for (let i = a; i < b; i++) { s += y[i] * y[i + tau]; e1 += y[i] ** 2; e2 += y[i + tau] ** 2; } return s / Math.sqrt(e1 * e2 + 1e-12); };
+  const rs = []; for (let k = 0; k < 900; k++) rs.push(k > 40 ? r(k) : 0);
+  const mx = Math.max(...rs); let bt = 0;
+  for (let k = 42; k < 898; k++) if (rs[k] >= 0.97 * mx && rs[k] >= rs[k - 1] && rs[k] >= rs[k + 1]) { bt = k; break; }
+  const den = rs[bt - 1] - 2 * rs[bt] + rs[bt + 1];
+  return sr / (bt + (den ? 0.5 * (rs[bt - 1] - rs[bt + 1]) / den : 0));
+}
+const c = (f, ref) => 1200 * Math.log2(f / ref);
+console.log(JSON.stringify([
+  c(run(220 * 2 ** (40 / 1200), 9, "minor", 0.005), 220),     // sharp A3 -> A3
+  c(run(207.65 * 2 ** (30 / 1200), 9, "minor", 0.005), 220),  // G#3 is not in A minor -> A3
+  c(run(73.42 * 2 ** (30 / 1200), 0, "chromatic", 0.005), 73.42),  // deep voice
+  c(run(659.26 * 2 ** (-40 / 1200), 0, "major", 0.005), 659.26),   // high voice
+  c(run(220 * 2 ** (40 / 1200), 9, "minor", null), 220),      // tuning off: untouched
+]));
+""")
+    r = subprocess.run(["node", str(tmp_path / "t.js"), str(tmp_path / "core.js")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    errs = json.loads(r.stdout)
+    assert all(abs(e) < 3.0 for e in errs[:4]), errs
+    assert abs(errs[4] - 40.0) < 3.0, errs
+
+
+def test_studio_beat_key_is_detected(tmp_path, demo_files):
+    from studiomix import studio
+
+    beat = studio.save_beat(tmp_path, "k", "beat.wav", (demo_files / "b.wav").read_bytes())
+    assert beat["scale"] in ("major", "minor", "chromatic") and 0 <= beat["tonic"] < 12
+    assert pitch.parse_key("chromatic") == (0, "chromatic")

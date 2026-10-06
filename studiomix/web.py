@@ -383,7 +383,7 @@ def render_page() -> str:
 
     profs = "".join(f'<option value="{n}">{n}</option>' for n in profiles.list_profiles())
     return (PAGE.replace("{{PRESETS}}", presets).replace("{{VERSION}}", __version__)
-            .replace("{{PROFILES}}", profs))
+            .replace("{{PROFILES}}", profs).replace("{{TUNE_JS}}", TUNE_JS))
 
 
 def serve_main(argv: list[str]) -> int:
@@ -412,6 +412,104 @@ def serve_main(argv: list[str]) -> int:
     except KeyboardInterrupt:
         print("\nstopped")
     return 0
+
+
+# Live auto-tune for monitoring while recording (runs in the browser's audio thread). The take
+# itself is saved raw; this is only what the singer hears in their earbuds. Kept free of browser
+# APIs so the same code is tested in Node (tests/test_studiomix.py).
+TUNE_JS = r"""
+const SCALE_STEPS = {major: [0, 2, 4, 5, 7, 9, 11], minor: [0, 2, 3, 5, 7, 8, 10],
+  chromatic: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]};
+class TuneCore {
+  // pitch tracker (YIN on a 4x decimated, 1 kHz low-passed copy) -> nearest note of the key
+  // (with hysteresis) -> pitch-synchronous two-head delay-line shifter (~10 ms of delay)
+  constructor(sr) {
+    this.sr = sr; this.N = 16384; this.buf = new Float32Array(this.N); this.w = 0;
+    this.dec = 4; this.dsr = sr / 4; this.dN = 1024; this.dbuf = new Float32Array(this.dN); this.dw = 0; this.dk = 0;
+    const w0 = 2 * Math.PI * 1000 / sr, al = Math.sin(w0) / (2 * 0.7071), c = Math.cos(w0), a0 = 1 + al;
+    this.lp = [(1 - c) / 2 / a0, (1 - c) / a0, (1 - c) / 2 / a0, -2 * c / a0, (1 - al) / a0];
+    this.z1 = 0; this.z2 = 0;
+    this.tmin = Math.max(2, Math.floor(this.dsr / 1100)); this.tmax = Math.ceil(this.dsr / 60); this.W = 256;
+    this.d = new Float32Array(this.tmax + 2);
+    this.f0 = 0; this.voiced = false; this.note = null; this.corr = 0; this.wet = 0;
+    this.phase = 0; this.L = sr * 0.02; this.Lt = this.L; this.minD = Math.round(sr * 0.002);
+    this.setKey(0, "chromatic"); this.speed = 0.015; this.amount = 1; this.blocks = 0; this.enabled = true;
+  }
+  setKey(tonic, scale) {
+    this.allowed = new Array(12).fill(false);
+    for (const s of SCALE_STEPS[scale] || SCALE_STEPS.chromatic) this.allowed[(tonic + s) % 12] = true;
+    this.note = null;
+  }
+  detect() {
+    const W = this.W, tmax = this.tmax, d = this.d, b = this.dbuf, M = this.dN - 1;
+    // the window is the newest W samples, each compared with the one `tau` earlier: the estimate
+    // describes the voice ~13 ms ago, about as late as the shifter plays it back
+    const start = (this.dw - W + this.dN) & M;
+    let energy = 0;
+    for (let j = 0; j < W; j++) { const x = b[(start + j) & M]; energy += x * x; }
+    if (energy / W < 1e-6) { this.voiced = false; return; }  // below -60 dBFS: silence
+    let run = 0, best = -1;
+    d[0] = 1;
+    for (let tau = 1; tau <= tmax; tau++) {
+      let s = 0;
+      for (let j = 0; j < W; j++) { const e = b[(start + j) & M] - b[(start + j - tau + this.dN) & M]; s += e * e; }
+      run += s; d[tau] = run > 0 ? s * tau / run : 1;
+    }
+    for (let tau = this.tmin; tau < tmax; tau++) {
+      if (d[tau] < 0.15) { while (tau + 1 < tmax && d[tau + 1] < d[tau]) tau++; best = tau; break; }
+    }
+    if (best < 0) { this.voiced = false; return; }
+    const a = d[best - 1], m = d[best], c = d[best + 1], den = a - 2 * m + c;
+    const t = best + (Math.abs(den) > 1e-9 ? 0.5 * (a - c) / den : 0);
+    this.f0 = this.dsr / t; this.voiced = true;
+  }
+  target(midi) {
+    // nearest allowed note; only leave the current note when another is clearly closer
+    let bestN = null, bestD = 99;
+    for (let n = Math.floor(midi) - 2; n <= Math.ceil(midi) + 2; n++) {
+      if (!this.allowed[((n % 12) + 12) % 12]) continue;
+      const dd = Math.abs(midi - n); if (dd < bestD) { bestD = dd; bestN = n; }
+    }
+    if (this.note !== null && this.allowed[((this.note % 12) + 12) % 12]
+        && Math.abs(midi - this.note) < bestD + 0.25 && Math.abs(midi - this.note) < 1.0) return this.note;
+    this.note = bestN; return bestN;
+  }
+  process(inp, out) {
+    const n = inp.length, sr = this.sr, M = this.N - 1, DM = this.dN - 1, lp = this.lp;
+    if ((this.blocks++ & 1) === 0) this.detect();
+    let want = 0, wetT = 0;
+    if (this.enabled && this.voiced && this.f0 > 55 && this.f0 < 1100) {
+      const midi = 69 + 12 * Math.log2(this.f0 / 440);
+      want = (this.target(midi) - midi) * this.amount; wetT = 1;
+      const P = sr / this.f0, m = Math.max(1, Math.ceil(0.006 * sr / P));
+      this.Lt = 2 * m * P;  // the two heads sit a whole number of periods apart: no comb
+    }
+    const a = Math.exp(-n / (Math.max(0.001, this.speed) * sr));
+    if (wetT) this.corr = a * this.corr + (1 - a) * want;
+    const ratio = Math.pow(2, this.corr / 12), aw = Math.exp(-1 / (0.012 * sr)), aL = Math.exp(-1 / (0.01 * sr));
+    for (let i = 0; i < n; i++) {
+      const x = inp[i];
+      this.buf[this.w] = x; this.w = (this.w + 1) & M;
+      const y = lp[0] * x + this.z1; this.z1 = lp[1] * x - lp[3] * y + this.z2; this.z2 = lp[2] * x - lp[4] * y;
+      if (++this.dk === this.dec) { this.dk = 0; this.dbuf[this.dw] = y; this.dw = (this.dw + 1) & DM; }
+      this.wet = aw * this.wet + (1 - aw) * wetT;
+      this.L = aL * this.L + (1 - aL) * this.Lt;
+      const L = this.L;
+      this.phase += (1 - ratio) / L; this.phase -= Math.floor(this.phase);
+      const p2 = this.phase + 0.5 - (this.phase >= 0.5 ? 1 : 0);
+      const g1 = Math.sin(Math.PI * this.phase) ** 2, g2 = 1 - g1;
+      const sh = g1 * this.read(this.minD + this.phase * L) + g2 * this.read(this.minD + p2 * L);
+      const dry = this.read(this.minD + 0.5 * L);
+      out[i] = this.wet * sh + (1 - this.wet) * dry;
+    }
+  }
+  read(delay) {
+    const pos = this.w - 1 - delay, i = Math.floor(pos), f = pos - i, M = this.N - 1;
+    const a = this.buf[i & M], b = this.buf[(i + 1) & M];
+    return a + f * (b - a);
+  }
+}
+"""
 
 
 PAGE = r"""<!doctype html>
@@ -575,6 +673,21 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
     <label style="display:flex;gap:8px;align-items:center;margin-top:8px" class="hint">Beat volume
       <input type="range" id="beatvol" min="0" max="1" step="0.05" value="0.8" style="flex:1"></label>
   </div></div>
+  <div class="row"><div><div class="lbl">Hear yourself</div>
+    <div class="hint" id="monhint">Your voice in your earbuds, auto-tuned live. Wired earbuds - Bluetooth arrives too late to sing with.</div></div>
+    <label class="switch"><input type="checkbox" id="monon"><span></span></label></div>
+  <div id="monopts" hidden>
+    <div class="seg" style="grid-template-columns:1fr 1fr 1fr">
+      <input type="radio" name="montune" id="mt0" value="off"><label for="mt0">Clean</label>
+      <input type="radio" name="montune" id="mt1" value="0.04" checked><label for="mt1">Natural</label>
+      <input type="radio" name="montune" id="mt2" value="0.005"><label for="mt2">Hard</label>
+    </div>
+    <div class="row"><div class="stack"><div class="lbl">Key</div>
+      <select id="monkey"><option value="auto">Auto - from the beat</option><option value="0,chromatic">Any note (chromatic)</option><option value="0,minor">C minor</option><option value="1,minor">C# minor</option><option value="2,minor">D minor</option><option value="3,minor">Eb minor</option><option value="4,minor">E minor</option><option value="5,minor">F minor</option><option value="6,minor">F# minor</option><option value="7,minor">G minor</option><option value="8,minor">Ab minor</option><option value="9,minor">A minor</option><option value="10,minor">Bb minor</option><option value="11,minor">B minor</option><option value="0,major">C major</option><option value="1,major">C# major</option><option value="2,major">D major</option><option value="3,major">Eb major</option><option value="4,major">E major</option><option value="5,major">F major</option><option value="6,major">F# major</option><option value="7,major">G major</option><option value="8,major">Ab major</option><option value="9,major">A major</option><option value="10,major">Bb major</option><option value="11,major">B major</option></select>
+      <div class="hint">A key you pick here is also used for the final auto-tune. Takes are saved untouched either way.</div></div></div>
+    <label style="display:flex;gap:8px;align-items:center" class="hint">Voice volume
+      <input type="range" id="monvol" min="0" max="1.5" step="0.05" value="0.9" style="flex:1"></label>
+  </div>
   <ul class="takes" id="takes"></ul>
 </section>
 
@@ -689,6 +802,7 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
 </main>
 <div class="go"><button id="go" form="f" type="submit">Mix &amp; master</button></div>
 
+<script type="text/plain" id="tunejs">{{TUNE_JS}}</script>
 <script>
 const $ = s => document.querySelector(s);
 const LABELS = {master_24bit: ["Master · 24-bit WAV", "upload this to your distributor"],
@@ -744,7 +858,17 @@ const Studio = (() => {
   const session = () => ($("#session").value || "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
   const fmt = t => { t = Math.max(0, t); return Math.floor(t / 60) + ":" + (t % 60).toFixed(1).padStart(4, "0"); };
   const parseT = v => { v = (v || "0").trim(); if (v.includes(":")) { const [m, s] = v.split(":"); return (+m) * 60 + (+s || 0); } return +v || 0; };
-  const WORKLET = `class Rec extends AudioWorkletProcessor {
+  const WORKLET = document.getElementById("tunejs").textContent + `
+  class Tune extends AudioWorkletProcessor {
+    constructor() { super(); this.core = new TuneCore(sampleRate);
+      this.port.onmessage = e => { const m = e.data;
+        if (m.key) this.core.setKey(m.key[0], m.key[1]);
+        if (m.speed !== undefined) this.core.speed = m.speed;
+        if (m.enabled !== undefined) this.core.enabled = m.enabled; }; }
+    process(inputs, outputs) { const i = inputs[0] && inputs[0][0], o = outputs[0] && outputs[0][0];
+      if (i && o) this.core.process(i, o); return true; } }
+  registerProcessor("tune", Tune);
+  class Rec extends AudioWorkletProcessor {
     constructor() { super(); this.buf = []; this.n = 0; this.start = 0; }
     process(inputs) {
       const ch = inputs[0] && inputs[0][0];
@@ -793,6 +917,37 @@ const Studio = (() => {
       return {data: out, first: first ?? 0};
     } };
   }
+  // live monitoring: mic -> tuner -> earbuds (the recorder taps the raw mic separately)
+  let mon = null;
+  function monKey() {
+    const v = $("#monkey").value, b = info && info.beat;
+    if (v === "auto") return b && b.scale ? [b.tonic, b.scale] : [0, "chromatic"];
+    const [t, sc] = v.split(","); return [+t, sc];
+  }
+  function monSettings() {
+    if (!mon) return;
+    const tune = document.querySelector("input[name=montune]:checked").value;
+    mon.node.port.postMessage({key: monKey(), enabled: tune !== "off", speed: tune === "off" ? 0.04 : +tune});
+    mon.gain.gain.value = +$("#monvol").value;
+  }
+  async function monitor(on) {
+    if (mon) { mon.src.disconnect(); mon.node.disconnect(); mon.gain.disconnect(); mon = null; }
+    $("#monopts").hidden = !on;
+    if (!on) return;
+    try {
+      const c = await audio(), s = await mic();
+      const src = c.createMediaStreamSource(s), node = new AudioWorkletNode(c, "tune", {outputChannelCount: [1]});
+      const gain = c.createGain(); src.connect(node); node.connect(gain); gain.connect(c.destination);
+      mon = {src, node, gain}; monSettings();
+    } catch (err) { $("#monon").checked = false; $("#monopts").hidden = true; alert("Microphone not available: " + err.message); }
+  }
+  function monHint() {
+    const b = info && info.beat, k = $("#monkey").value === "auto" && b ? ` Beat key: ${b.key}.` : "";
+    $("#monhint").textContent = (latencyMs > 100
+      ? `Your earbuds lag ${Math.round(latencyMs)} ms - that's Bluetooth. Hearing yourself that late is confusing; use wired earbuds for this.`
+      : "Your voice in your earbuds, auto-tuned live. Wired earbuds - Bluetooth arrives too late to sing with.") + k;
+    $("#monhint").classList.toggle("warn", latencyMs > 100);
+  }
   function wav(data, sr) {  // 32-bit float mono WAV: no quality loss, keeps headroom
     const buf = new ArrayBuffer(44 + data.length * 4), v = new DataView(buf);
     const w = (o, str) => [...str].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
@@ -810,6 +965,7 @@ const Studio = (() => {
   }
   function render() {
     $("#latval").textContent = Math.round(latencyMs) + " ms";
+    monHint(); monSettings();
     $("#beatname").textContent = info && info.beat ? `${info.beat.name} · ${fmt(info.beat.duration_s)}` : "Tap to choose (saved with the song)";
     $("#studiobeat").closest("label").classList.toggle("has", !!(info && info.beat));
     const ul = $("#takes"); ul.innerHTML = "";
@@ -987,6 +1143,18 @@ const Studio = (() => {
     } finally { uploading = false; $("#recbtn").disabled = false; render(); }
   });
   $("#recbtn").addEventListener("click", record);
+  $("#monon").addEventListener("change", e => monitor(e.target.checked));
+  document.querySelectorAll("input[name=montune]").forEach(r => r.addEventListener("change", monSettings));
+  $("#monvol").addEventListener("input", monSettings);
+  $("#monkey").addEventListener("change", () => {
+    const v = $("#monkey").value, k = document.querySelector("input[name=key]");
+    if (k && (k.value === "" || k.dataset.fromStudio)) {  // also tune the final mix in this key
+      k.value = v === "auto" ? "" : $("#monkey").selectedOptions[0].textContent.replace("Any note (chromatic)", "chromatic");
+      k.dataset.fromStudio = v === "auto" ? "" : "1";
+    }
+    monSettings(); monHint();
+  });
+  $("#micsel").addEventListener("change", () => { if (mon) monitor(true); });
   $("#calib").addEventListener("click", calibrate);
   $("#latval").addEventListener("click", () => { const v = prompt("Earbud delay in ms", Math.round(latencyMs));
     if (v !== null && !isNaN(+v)) { latencyMs = +v; lsSet("sm_latency", String(latencyMs)); render(); } });
