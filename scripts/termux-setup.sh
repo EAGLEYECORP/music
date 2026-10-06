@@ -4,7 +4,9 @@
 set -e
 
 echo "==> updating packages"
-pkg update -y
+# keep the installed config files and never stop to ask (a stuck prompt looks like a hang)
+export DEBIAN_FRONTEND=noninteractive
+pkg update -y -o Dpkg::Options::="--force-confold" || pkg update -y
 
 echo "==> installing python, numpy, scipy and ffmpeg from Termux packages (no compiling)"
 pkg install -y python python-numpy ffmpeg git
@@ -21,6 +23,10 @@ pip install -e .
 
 echo "==> giving Termux access to your phone storage (accept the popup)"
 termux-setup-storage || true
+
+echo
+echo "==> checking everything works on this phone (makes a short test song, about a minute)"
+studiomix doctor --quick || true
 
 echo
 echo "Done. Start the app (opens in your phone's browser):"

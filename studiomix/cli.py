@@ -84,6 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ad-lib loudness vs. the lead vocal in dB (default about -4)")
     g.add_argument("--adlib-pan", dest="adlib_pan", type=float, help="ad-lib left/right spread 0-1")
     g.add_argument("--width", dest="master_width", type=float, help="stereo width of the highs (1 = unchanged)")
+    g.add_argument("--punch", type=float, nargs="?", const=1.0, metavar="0-1",
+                   help="trade up to 2 LU of loudness (never below -11 LUFS) for harder-hitting drums; "
+                        "plays just as loud on streaming services")
     return ap
 
 
@@ -158,6 +161,8 @@ def master_main(argv: list[str]) -> int:
     ap.add_argument("--lufs", dest="target_lufs", type=float)
     ap.add_argument("--ceiling", dest="ceiling_dbtp", type=float)
     ap.add_argument("--width", dest="master_width", type=float)
+    ap.add_argument("--punch", type=float, nargs="?", const=1.0, metavar="0-1",
+                    help="trade up to 2 LU of loudness for punch (never below -11 LUFS)")
     ap.add_argument("--deliver", metavar="VERSIONS",
                     help="extra verified versions: " + ", ".join(DELIVERY_PROFILES))
     ap.add_argument("--profile", metavar="NAME", help="master toward a learned reference profile")
@@ -243,6 +248,10 @@ def main(argv: list[str] | None = None) -> int:
         return serve_main(argv[1:])
     if argv and argv[0] == "master":
         return master_main(argv[1:])
+    if argv and argv[0] == "doctor":
+        from .doctor import main as doctor_main
+
+        return doctor_main(argv[1:])
     args = build_parser().parse_args(argv)
     overrides = {}
     if args.tune:

@@ -110,7 +110,16 @@ bash scripts/termux-setup.sh
 ```
 
 The script installs Python, numpy, scipy and ffmpeg as ready-made Termux packages, so nothing has
-to compile. It then installs studiomix and asks for access to your phone's storage. After that:
+to compile. It then installs studiomix, asks for access to your phone's storage, and runs
+`studiomix doctor`. You can run the doctor again any time:
+
+```bash
+studiomix doctor
+```
+
+It checks Python, numpy, scipy, ffmpeg, storage access and free memory, then mixes and masters
+a short test song. It tells you whether the master passed and how long a 3-minute song will take
+on your phone. Every problem it finds comes with the command that fixes it. After that:
 
 ```bash
 cd ~/storage/downloads
@@ -141,7 +150,14 @@ In the app, choose **🎙️ Record**:
    - **✎ Edit** any take: waveform, trim start/end, nudge ±150 ms, volume ±12 dB.
    - Background noise (fans, AC, hiss, hum) is removed automatically in the mix. The strength
      adapts to how noisy the take is, so a clean take isn't touched.
-4. Tap **Mix & master**: your ★ takes are laid on the beat's timeline and go through auto-tune,
+4. **Hear yourself, auto-tuned live (wired earbuds):** switch on *Hear yourself* and your voice
+   comes back into your earbuds already tuned to the song's key while you sing. The key is
+   detected from the beat when you load it, or you can pick it. *Hard* gives the instant robotic
+   snap, *Natural* keeps your vibrato, *Clean* is just you. It adds about 10 ms of delay. The
+   takes themselves are saved raw, so the studio-grade auto-tune in the mix still does the real
+   tuning, and a key you pick here is used there too. Bluetooth earbuds arrive 150–300 ms late,
+   which is too late to sing along with yourself, and the app warns you if it measured that.
+5. Tap **Mix & master**: your ★ takes are laid on the beat's timeline and go through auto-tune,
    harmonies, doubles, the mix and the verified master.
 
 The recorder captures the raw mic: the phone's call processing (echo cancellation, noise
@@ -325,6 +341,7 @@ studiomix vox.wav beat.mp3 -p hiphop -a adlibs.wav hype.wav --tune hard --key "C
 | `--deess 10` | max de-essing (dB, 0 = off) |
 | `--carve 4` | how much the beat makes room for the vocal (dB) |
 | `--lufs -10` / `--ceiling -1` | loudness target / true-peak ceiling |
+| `--punch` (or `--punch 0.5`) | trade up to 2 LU of loudness (never below -11 LUFS) for harder-hitting drums - see below |
 | `--reference song.wav` | match the tone of a song you like |
 | `--offset-ms 25` | shift the vocals if they were exported late/early |
 | `--harmony 3up,5down` / `--harmony-level -9` | harmony voices in key / their level (dB) |
@@ -334,6 +351,17 @@ studiomix vox.wav beat.mp3 -p hiphop -a adlibs.wav hype.wav --tune hard --key "C
 | `--key-changes` | detect a key per song section |
 
 Run `studiomix --help` for everything.
+
+**Punch vs. loudness, measured.** For a loud master, the limiter is where punch goes: on a
+trap test song, how much each drum hit jumps out (the first 30 ms of the hit vs. 60–200 ms
+after) drops from 7.2 dB at -14 LUFS to 6.2 dB at -8.5 LUFS. Five other tricks were measured at
+the same loudness: clipping more and limiting less, a slower limiter, a transient shaper,
+clipping the 808 separately, and lighter bus compression. None of them got more than 0.2 dB
+back. Once the drum peaks sit at the ceiling and the loudness fixes the body, there is nothing
+left to move. What does work is a little less loudness. Spotify, YouTube, Apple Music and
+Tidal play every song at the same level (about -14 LUFS), so a -10.5 LUFS master plays exactly
+as loud there as a -8.5 one, and hits harder. `--punch` (or *Punch over loudness* in the app)
+makes that trade: trap goes from -8.5 to -10.5 LUFS and PLR from 6.4 to 8.4 dB.
 
 ## Tips for the best result
 

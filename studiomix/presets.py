@@ -61,6 +61,7 @@ class Preset:
     target_lufs: float = -12.0
     ceiling_dbtp: float = -1.0
     limiter_release_ms: float = 80.0
+    punch: float = 0.0                  # 0-1: give up to 2 LU of loudness (never below -11 LUFS) for punch
 
 
 PRESETS: dict[str, Preset] = {
@@ -179,4 +180,5 @@ SAFE_RANGES = {
     "tune_amount": (0.0, 1.0, "tune amount"),
     "tune_flex_cents": (0.0, 100.0, "flex (cents)"),
     "master_width": (0.0, 2.0, "width"),
+    "punch": (0.0, 1.0, "punch"),
 }

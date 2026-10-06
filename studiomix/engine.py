@@ -284,6 +284,15 @@ def deliver(pre: np.ndarray, premaster: np.ndarray, sr: int, preset: Preset, nam
             extra: list[str] | None = None) -> dict:
     """Loudness + limiting, every export, extra delivery versions, and verification of the files
     as written. Shared by the vocal+beat pipeline and the finished-mix mastering pipeline."""
+    if preset.punch > 0 and preset.target_lufs > -11.0:
+        # Measured: at a fixed loudness and ceiling, no clipper/limiter/transient trick buys back
+        # hit contrast - the drum peaks sit at the ceiling and the loudness fixes the body. What
+        # does: a little less loudness. Streaming plays every master at -14 LUFS, so the quieter
+        # master plays just as loud there, and hits harder.
+        louder = preset.target_lufs
+        preset = replace(preset, target_lufs=round(max(-11.0, louder - 2.0 * preset.punch), 1))
+        log["master"]["punch"] = {"amount": preset.punch, "loudness_from": louder, "loudness_to": preset.target_lufs}
+        say(f"punch: loudness {louder} -> {preset.target_lufs} LUFS (same volume on streaming, harder-hitting drums)")
     ceiling = preset.ceiling_dbtp
     if preset.target_lufs > -14.0 and not ceiling_overridden and ceiling > -2.0:
         # Spotify: masters louder than -14 LUFS should peak below -2 dBTP to survive lossy encoding
@@ -411,7 +420,8 @@ def delivery_check(m: dict, ceiling: float, target: float | None = None,
         {"check": "Mono compatible (stereo correlation > 0)", "ok": m["stereo_correlation"] > 0.0,
          "detail": f"{m['stereo_correlation']}"},
         {"check": "Dynamics (PLR >= 7 dB; loud trap masters often sit at 6-7)", "ok": m["plr_db"] >= 7.0,
-         "detail": f"PLR {m['plr_db']} dB"},
+         "detail": f"PLR {m['plr_db']} dB" + ("" if m["plr_db"] >= 7.0 else
+                                                " - for more punch, trade a little loudness: --punch")},
     ]
     turn_down = max(0.0, lufs + 14.0)
     checks.append({
@@ -436,6 +446,9 @@ def format_report(name: str, log: dict) -> str:
         "FINAL MASTER",
         f"  Integrated loudness : {o['integrated_lufs']} LUFS   (target {log['master']['target_lufs']})",
         f"  True peak           : {o['true_peak_dbtp']} dBTP   (ceiling {log['master']['ceiling_dbtp']})",
+        *([f"  Punch               : loudness {log['master']['punch']['loudness_from']} -> "
+           f"{log['master']['punch']['loudness_to']} LUFS for harder-hitting drums (same volume on streaming)"]
+          if log["master"].get("punch") else []),
         f"  Loudness range      : {o['loudness_range_lu']} LU",
         f"  Peak-to-loudness    : {o['plr_db']} dB",
         f"  Stereo correlation  : {o['stereo_correlation']}",

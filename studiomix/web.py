@@ -332,6 +332,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "numbers only for flex / loudness / vocal level"})
         if f("doubles") == "on":
             overrides["doubles"] = True
+        if f("punch") == "on":
+            overrides["punch"] = 1.0
         harmonies = ",".join(fields.get("harmony", []))
         if harmonies:
             overrides["harmonies"] = harmonies
@@ -749,6 +751,12 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
     </div></div></div>
   <div class="row"><div class="stack"><div class="lbl">Only on the hook</div>
     <input type="text" name="stack_at" placeholder="Everywhere (or e.g. 0:45-1:15, 2:10-2:40)" autocomplete="off"></div></div>
+</section>
+
+<section>
+  <div class="row"><div><div class="lbl">Punch over loudness</div>
+    <div class="hint">Up to 2 dB less loud master (never under -11 LUFS), harder-hitting drums. Plays just as loud on Spotify, YouTube and Apple Music - they turn every song to the same level.</div></div>
+    <label class="switch"><input type="checkbox" name="punch"><span></span></label></div>
 </section>
 
 <section>

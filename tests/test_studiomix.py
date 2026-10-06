@@ -800,3 +800,22 @@ def test_studio_beat_key_is_detected(tmp_path, demo_files):
     beat = studio.save_beat(tmp_path, "k", "beat.wav", (demo_files / "b.wav").read_bytes())
     assert beat["scale"] in ("major", "minor", "chromatic") and 0 <= beat["tonic"] < 12
     assert pitch.parse_key("chromatic") == (0, "chromatic")
+
+
+def test_punch_trades_loudness_for_dynamics(demo_files, tmp_path):
+    from studiomix.engine import run
+
+    p = get_preset("trap", punch=1.0)
+    log = run(demo_files / "v.wav", demo_files / "b.wav", tmp_path, p, name="punch", verbose=False)
+    assert log["master"]["punch"]["loudness_to"] == -10.5
+    assert abs(log["output"]["integrated_lufs"] + 10.5) <= 0.1
+    assert log["output"]["true_peak_dbtp"] <= -2.0 + 0.01  # still the loud-master Spotify ceiling
+    assert "Punch" in (tmp_path / "punch_report.txt").read_text()
+
+
+def test_doctor_checks_device_and_makes_a_test_song(capsys):
+    from studiomix.cli import main
+
+    assert main(["doctor", "--quick"]) == 0
+    out = capsys.readouterr().out
+    assert "[PASS] test song" in out and "3-minute song takes about" in out and "[FAIL]" not in out
