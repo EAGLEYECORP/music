@@ -163,4 +163,20 @@ def get_preset(preset_name: str, **overrides) -> Preset:
         raise KeyError(f"unknown preset '{preset_name}'. choose from: {', '.join(PRESETS)}")
     valid = {f.name for f in fields(Preset)} - {"name", "description"}
     clean = {k: v for k, v in overrides.items() if v is not None and k in valid}
+    for k, (lo, hi, what) in SAFE_RANGES.items():
+        v = clean.get(k)
+        if v is not None and not (lo <= v <= hi):
+            raise ValueError(f"{what} must be between {lo:g} and {hi:g} (got {v:g})")
     return replace(PRESETS[preset_name], **clean)
+
+
+# values outside these are mistakes (a ceiling above 0 dBTP clips every platform's decoder;
+# -40 LUFS is inaudible), so they are refused rather than rendered
+SAFE_RANGES = {
+    "target_lufs": (-30.0, -5.0, "loudness target (LUFS)"),
+    "ceiling_dbtp": (-6.0, 0.0, "true-peak ceiling (dBTP)"),
+    "vocal_balance_db": (-12.0, 12.0, "vocal level (dB)"),
+    "tune_amount": (0.0, 1.0, "tune amount"),
+    "tune_flex_cents": (0.0, 100.0, "flex (cents)"),
+    "master_width": (0.0, 2.0, "width"),
+}

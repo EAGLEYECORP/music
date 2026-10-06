@@ -185,33 +185,68 @@ def deess(x: np.ndarray, sr: int, active: np.ndarray, split_hz: float = 4500.0, 
 
 # ---------------------------------------------------------------- limiting
 
-def _refined_peaks(up: np.ndarray) -> np.ndarray:
+def _refined_peaks(up: np.ndarray, refine_from: float = 0.0) -> np.ndarray:
     """|signal| with each local extremum replaced by the vertex of the parabola through it and its
     two neighbours. A 4x-oversampled grid can still miss the top of a fast peak by ~0.15 dB; the
-    parabola recovers it (worst-case error < 0.02 dB), at a fraction of the cost of 8x."""
-    a0, a1, a2 = up[..., :-2], up[..., 1:-1], up[..., 2:]
+    parabola recovers it (worst-case error < 0.02 dB), at a fraction of the cost of 8x.
+    Only points above `refine_from` are refined (refinement never lifts a value by more than
+    ~0.2 dB, so callers that care about the top only pass a threshold just below it)."""
+    out = np.abs(up)
+    if out.shape[-1] < 3:
+        return out
+    idx = np.nonzero(out[..., 1:-1] > refine_from)
+    if not idx[0].size:
+        return out
+    j = idx[-1] + 1
+    lead = idx[:-1]
+    a0, a1, a2 = up[(*lead, j - 1)], up[(*lead, j)], up[(*lead, j + 1)]
     den = a0 - 2.0 * a1 + a2
     is_ext = ((a1 >= a0) & (a1 >= a2)) | ((a1 <= a0) & (a1 <= a2))
     with np.errstate(divide="ignore", invalid="ignore"):
         vertex = a1 - (a2 - a0) ** 2 / (8.0 * den)
     vertex = np.where(is_ext & (np.abs(den) > 1e-12), vertex, a1)
-    out = np.abs(up)
-    out[..., 1:-1] = np.maximum(out[..., 1:-1], np.abs(vertex))
+    out[(*lead, j)] = np.maximum(out[(*lead, j)], np.abs(vertex))
     return out
 
 
-def true_peak_envelope(x: np.ndarray, oversample: int = 4) -> np.ndarray:
-    """Per-sample true-peak magnitude (max over the oversampled signal, all channels)."""
+_REFINE_MARGIN = 10.0 ** (-0.5 / 20.0)  # refine everything within 0.5 dB of the level that matters
+
+
+# Oversampling a whole song at once costs ~640 MB for 3.5 min of stereo at 48 kHz (x4). Work in
+# blocks instead; each block is padded with real neighbouring samples, longer than the resampling
+# filter reaches, so the result is identical to processing everything at once.
+_BLOCK = 1 << 18  # ~5 s at 48 kHz
+_PAD = 128
+
+
+def _os_blocks(n: int):
+    for s0 in range(0, n, _BLOCK):
+        a, b = max(0, s0 - _PAD), min(n, s0 + _BLOCK + _PAD)
+        yield s0, min(n, s0 + _BLOCK), a, b
+
+
+def true_peak_envelope(x: np.ndarray, oversample: int = 4, exact_above: float = 0.0) -> np.ndarray:
+    """Per-sample true-peak magnitude (max over the oversampled signal, all channels).
+    Values below `exact_above` (linear) may read up to ~0.2 dB low - pass the level you act on."""
     n = x.shape[-1]
-    up = signal.resample_poly(x, oversample, 1, axis=-1)
-    a = np.max(_refined_peaks(up), axis=0)[: n * oversample].reshape(n, oversample).max(axis=1)
-    return np.maximum(a, np.roll(a, -1))  # inter-sample peaks straddle two samples
+    out = np.empty(n)
+    for s0, s1, a, b in _os_blocks(n):
+        up = signal.resample_poly(x[:, a:b], oversample, 1, axis=-1)
+        m = np.max(_refined_peaks(up, exact_above * _REFINE_MARGIN), axis=0)
+        m = m[: (b - a) * oversample].reshape(b - a, oversample).max(axis=1)
+        out[s0:s1] = m[s0 - a: s1 - a]
+    return np.maximum(out, np.roll(out, -1))  # inter-sample peaks straddle two samples
 
 
 def true_peak_db(x: np.ndarray, oversample: int = 4) -> float:
     """ITU-R BS.1770-style true peak (dBTP): 4x oversampling plus parabolic peak refinement."""
-    up = signal.resample_poly(x, oversample, 1, axis=-1)
-    return float(20.0 * np.log10(np.max(_refined_peaks(up)) + EPS))
+    peak = 0.0
+    for _s0, _s1, a, b in _os_blocks(x.shape[-1]):
+        up = signal.resample_poly(x[:, a:b], oversample, 1, axis=-1)
+        if up.size:
+            floor = max(peak, float(np.max(np.abs(up)))) * _REFINE_MARGIN
+            peak = max(peak, float(np.max(_refined_peaks(up, floor))))
+    return float(20.0 * np.log10(peak + EPS))
 
 
 def soft_clip(x: np.ndarray, ceiling_db: float, knee_db: float = 3.0, oversample: int = 4) -> np.ndarray:
@@ -220,20 +255,27 @@ def soft_clip(x: np.ndarray, ceiling_db: float, knee_db: float = 3.0, oversample
     k = t * 10.0 ** (-knee_db / 20.0)
     if np.max(np.abs(x)) < k * 0.5:  # far below the knee even allowing for inter-sample peaks
         return x
-    up = signal.resample_poly(x, oversample, 1, axis=-1)
-    over = np.abs(up) > k
-    if not over.any():
-        return x
-    a = np.abs(up[over])
-    up[over] = np.sign(up[over]) * (k + (t - k) * np.tanh((a - k) / (t - k)))
-    return signal.resample_poly(up, 1, oversample, axis=-1)[:, : x.shape[-1]]
+    out = x.copy()
+    for s0, s1, a, b in _os_blocks(x.shape[-1]):
+        seg = x[:, a:b]
+        if np.max(np.abs(seg)) < k * 0.5:
+            continue
+        up = signal.resample_poly(seg, oversample, 1, axis=-1)
+        over = np.abs(up) > k
+        if not over.any():
+            continue
+        av = np.abs(up[over])
+        up[over] = np.sign(up[over]) * (k + (t - k) * np.tanh((av - k) / (t - k)))
+        down = signal.resample_poly(up, 1, oversample, axis=-1)[:, : b - a]
+        out[:, s0:s1] = down[:, s0 - a: s1 - a]
+    return out
 
 
 def limit(x: np.ndarray, sr: int, ceiling_db: float = -1.0, lookahead_ms: float = 1.5,
           release_ms: float = 80.0, oversample: int = 4):
     """Look-ahead true-peak brickwall limiter. Returns (output, gain_reduction_db)."""
     c = 10.0 ** (ceiling_db / 20.0)
-    env = true_peak_envelope(x, oversample)
+    env = true_peak_envelope(x, oversample, exact_above=c)
     req = np.minimum(1.0, c / np.maximum(env, EPS))
     a = max(1, int(lookahead_ms * 1e-3 * sr))
     width = 2 * a + 1

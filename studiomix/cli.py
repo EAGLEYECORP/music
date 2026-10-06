@@ -251,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
     overrides.update({k: v for k, v in vars(args).items() if v is not None})
     try:
         preset = get_preset(args.preset, **overrides)
-    except KeyError as e:
+    except (KeyError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

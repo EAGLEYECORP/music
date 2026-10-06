@@ -204,8 +204,10 @@ def section_mask(n: int, sr: int, ranges: list[tuple[float, float]] | None, fade
     m = np.zeros(n)
     for a, b in ranges:
         m[max(0, int(a * sr)):min(n, int(b * sr))] = 1.0
-    k = max(1, int(sr * fade_ms / 1000))
-    return np.clip(np.convolve(m, np.ones(k) / k, mode="same"), 0.0, 1.0)
+    from scipy.ndimage import uniform_filter1d
+
+    # running average (linear time; a plain convolution would be O(n * k) on a full song)
+    return np.clip(uniform_filter1d(m, max(1, int(sr * fade_ms / 1000)), mode="constant"), 0.0, 1.0)
 
 
 def build_stack(lead: np.ndarray, sr: int, capture: dict, p: Preset, active: np.ndarray,
@@ -499,21 +501,33 @@ def finalize_loudness(x: np.ndarray, sr: int, target_lufs: float, ceiling_dbtp: 
         return y, gr, analysis.integrated_lufs(y, sr)
 
     aim = target_lufs + 0.04
+    # keep only two candidate renders (closest at/above the target, and the loudest below it):
+    # holding every trial would cost ~150 MB per minute of stereo audio, too much on a phone
+    best_above = best_below = None
+
+    def keep(r):
+        nonlocal best_above, best_below
+        if r[0] >= target_lufs:
+            if best_above is None or r[0] < best_above[0]:
+                best_above = r
+        elif best_below is None or r[0] > best_below[0]:
+            best_below = r
+
     g0 = start_gain_db if start_gain_db is not None else target_lufs - analysis.integrated_lufs(x, sr)
     y, gr, l0 = render(g0)
-    renders = [(l0, g0, y, gr)]
+    keep((l0, g0, y, gr))
     g1 = g0 + (aim - l0) * 1.3  # limiting eats part of every boost
     for _ in range(6):
-        if any(0.0 <= l_ - target_lufs <= 0.15 for l_, *_ in renders):
+        if best_above is not None and best_above[0] - target_lufs <= 0.15:
             break
         y, gr, l1 = render(g1)
-        renders.append((l1, g1, y, gr))
+        keep((l1, g1, y, gr))
+        del y, gr
         slope = (l1 - l0) / (g1 - g0) if abs(g1 - g0) > 1e-6 else 1.0
         slope = float(np.clip(slope, 0.1, 1.0))
         g0, l0 = g1, l1
         g1 = g1 + (aim - l1) / slope
-    above = [r for r in renders if r[0] >= target_lufs]
-    lufs, gain, y, gr = min(above, key=lambda r: r[0]) if above else max(renders, key=lambda r: r[0])
+    lufs, gain, y, gr = best_above if best_above is not None else best_below
     if lufs > target_lufs:
         y = _gain(y, target_lufs - lufs)  # final exact trim (down only)
     log["drive_db"] = round(float(gain), 3)

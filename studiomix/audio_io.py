@@ -39,8 +39,11 @@ def _read_wav(path: Path) -> tuple[np.ndarray, int]:
 def _ffmpeg_decode(path: Path) -> tuple[np.ndarray, int]:
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "decoded.wav"
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-c:a", "pcm_f32le", str(wav)],
-                       check=True)
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-vn", "-c:a", "pcm_f32le", str(wav)],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not wav.exists():
+            msg = (r.stderr or "").strip().splitlines()
+            raise RuntimeError(f"could not decode {path.name}: {msg[-1] if msg else 'not an audio file'}")
         return _read_wav(wav)
 
 
@@ -99,7 +102,7 @@ def _write_pcm(path: str | Path, ints: np.ndarray, sr: int, bits: int) -> None:
 
 
 def write_wav(path: str | Path, x: np.ndarray, sr: int, bits: int = 24) -> None:
-    x = np.clip(x, -1.0, 1.0)
+    x = np.clip(np.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
     if bits == 32:
         wavfile.write(str(path), sr, x.T.astype(np.float32))
         return

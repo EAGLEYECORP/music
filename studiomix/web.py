@@ -153,7 +153,35 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj) -> None:
         self._send(code, json.dumps(obj).encode(), "application/json")
 
+    def _host_ok(self) -> bool:
+        """DNS-rebinding guard: only answer requests addressed to localhost or an IP address.
+        A hostile web page can make its own domain point at 127.0.0.1, but the browser still
+        sends that domain name as Host - so it is refused, and your takes can't be read."""
+        import ipaddress
+
+        host = (self.headers.get("Host") or "").strip().lower()
+        name = host[: host.find("]") + 1] if host.startswith("[") else host.split(":")[0]
+        if name == "localhost":
+            return True
+        try:
+            ipaddress.ip_address(name.strip("[]"))
+            return True
+        except ValueError:
+            return False
+
+    def _origin_ok(self) -> bool:
+        """CSRF guard: a request that changes something must come from this app's own page. Browsers
+        always send Origin on cross-site POSTs; tools like curl send none and are allowed."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        from urllib.parse import urlsplit
+
+        return origin != "null" and urlsplit(origin).netloc.lower() == (self.headers.get("Host") or "").lower()
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self._host_ok():
+            return self._json(403, {"error": "forbidden host"})
         if self.path in ("/", "/index.html"):
             return self._send(200, render_page().encode(), "text/html; charset=utf-8")
         m = re.fullmatch(r"/api/jobs/([0-9a-f]{12})", self.path)
@@ -198,6 +226,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._host_ok() or not self._origin_ok():
+            return self._json(403, {"error": "forbidden: requests must come from the studiomix page"})
         st = re.fullmatch(r"/api/studio/([A-Za-z0-9_-]{1,40})/(beat|take|delete/([0-9a-f]{10})|update/([0-9a-f]{10}))",
                           self.path)
         if self.path not in ("/api/jobs", "/api/learn") and not st:
@@ -207,7 +237,10 @@ class Handler(BaseHTTPRequestHandler):
 
             studio.delete_take(self.jobs_dir, st.group(1), st.group(3))
             return self._json(200, studio.info(self.jobs_dir, st.group(1)))
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
         if length <= 0 or length > MAX_UPLOAD:
             return self._json(413, {"error": "upload too large (max 1 GB)"})
         ctype = self.headers.get("Content-Type", "")
@@ -302,7 +335,10 @@ class Handler(BaseHTTPRequestHandler):
         harmonies = ",".join(fields.get("harmony", []))
         if harmonies:
             overrides["harmonies"] = harmonies
-        preset = get_preset(preset_name, **overrides)
+        try:
+            preset = get_preset(preset_name, **overrides)
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
 
         job_id = uuid.uuid4().hex[:12]
         first = f("session") if mode == "studio" else files["mix" if mode == "mix" else "lead"][0][0]

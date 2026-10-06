@@ -58,11 +58,17 @@ def save_beat(root: Path, session: str, filename: str, data: bytes) -> dict:
     ext = Path(filename).suffix.lower() or ".wav"
     if ext not in {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".aif", ".aiff", ".opus"}:
         ext = ".wav"
+    tmp = d / f"upload{ext}"
+    tmp.write_bytes(data)
+    try:
+        x, sr = audio_io.load(tmp)  # validate it decodes before replacing the current beat
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     for old in d.glob("beat.*"):
         old.unlink()
     path = d / f"beat{ext}"
-    path.write_bytes(data)
-    x, sr = audio_io.load(path)  # validate it decodes
+    tmp.replace(path)
     with _lock:
         meta = _meta(d)
         meta["beat"] = {"file": path.name, "name": Path(filename).name, "duration_s": round(x.shape[-1] / sr, 2)}
@@ -78,7 +84,11 @@ def add_take(root: Path, session: str, data: bytes, role: str, offset_s: float, 
     tid = uuid.uuid4().hex[:10]
     path = d / "takes" / f"{tid}.wav"
     path.write_bytes(data)
-    x, sr = audio_io.load(path)
+    try:
+        x, sr = audio_io.load(path)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
     peak = float(np.max(np.abs(x))) if x.size else 0.0
     take = {"id": tid, "role": role, "offset_s": round(max(0.0, float(offset_s)), 3),
             "duration_s": round(x.shape[-1] / sr, 2), "sr": sr, "latency_ms": round(float(latency_ms), 1),
@@ -119,6 +129,8 @@ def update_take(root: Path, session: str, tid: str, changes: dict) -> dict:
                 continue
             v = changes[k]
             v = (str(v).lower() in ("1", "true", "on", "yes")) if conv is bool else float(v)
+            if conv is float and not np.isfinite(v):
+                raise ValueError(f"{k} must be a number")
             if k in LIMITS:
                 v = float(np.clip(v, *LIMITS[k]))
             if k in ("trim_start_s", "trim_end_s"):
@@ -187,7 +199,7 @@ def build_tracks(root: Path, session: str) -> dict:
                 x = x[:, int(round(-start * tsr)):]
                 start = 0.0
             clips.append((start, audio_io.resample(x, tsr, sr)))
-        n = max(int(o * sr) + c.shape[-1] for o, c in clips)
+        n = max(int(round(o * sr)) + c.shape[-1] for o, c in clips)
         track = np.zeros((1, n))
         for o, c in clips:
             a = int(round(o * sr))

@@ -86,6 +86,8 @@ def analyse(path) -> dict:
     a, b = song_body(x, sr)
     x = x[:, a:b]
     m = analysis.measure(x, sr)
+    if not np.isfinite(m["integrated_lufs"]) or m["integrated_lufs"] < -50:
+        raise ValueError(f"{Path(path).name} is silent or nearly silent - not a usable reference")
     f, db = filters.ltas_db(np.mean(x, axis=0), sr)
     db = filters.fractional_octave_smooth(f, db, 1 / 3)
     # lossy cutoff: where the spectrum falls 45 dB below the 1-2 kHz level for good

@@ -681,3 +681,75 @@ def test_studio_comping_trim_nudge_gain(tmp_path, demo_files):
     studio.update_take(tmp_path, "hook", passes[0]["id"], {"active": "0"})
     with pytest.raises(ValueError):
         studio.build_tracks(tmp_path, "hook")
+
+
+def test_web_server_blocks_rebinding_and_csrf(tmp_path):
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from studiomix import web
+
+    web.Handler.jobs_dir = tmp_path
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+    try:
+        assert urllib.request.urlopen(base + "/").status == 200
+        # DNS rebinding: a hostile domain pointed at 127.0.0.1 sends its own name as Host
+        req = urllib.request.Request(base + "/api/studio/my-song", headers={"Host": f"evil.example:{port}"})
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req)
+        assert e.value.code == 403
+        # CSRF: a POST from another site's page
+        req = urllib.request.Request(base + "/api/studio/my-song/delete/0123456789", data=b"", method="POST",
+                                     headers={"Origin": "https://evil.example"})
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req)
+        assert e.value.code == 403
+        # the app's own page is fine
+        req = urllib.request.Request(base + "/api/studio/my-song/delete/0123456789", data=b"", method="POST",
+                                     headers={"Origin": base})
+        assert urllib.request.urlopen(req).status == 200
+    finally:
+        httpd.shutdown()
+
+
+def test_studio_rejects_bad_uploads_and_edits(tmp_path, demo_files):
+    from studiomix import studio
+
+    good = (demo_files / "b.wav").read_bytes()
+    studio.save_beat(tmp_path, "s", "beat.wav", good)
+    # a broken beat upload must not destroy the beat already there
+    with pytest.raises(Exception):
+        studio.save_beat(tmp_path, "s", "beat.mp3", b"not audio at all")
+    d = studio.session_dir(tmp_path, "s")
+    assert (d / "beat.wav").exists() and not list(d.glob("upload.*"))
+    assert studio.info(tmp_path, "s")["beat"]["name"] == "beat.wav"
+    # a broken take leaves no file behind
+    with pytest.raises(Exception):
+        studio.add_take(tmp_path, "s", b"RIFFjunk", "lead", 0, 0)
+    assert not list((d / "takes").glob("*.wav"))
+    # NaN edits are refused (they would corrupt the session file for the browser)
+    p = tmp_path / "t.wav"
+    sr = 44100
+    audio_io.write_wav(p, np.full((1, sr), 0.1), sr, 32)
+    # offsets that land on a rounding boundary must not overflow the timeline
+    for off in (0.0, 1.0, 2.0):
+        t = studio.add_take(tmp_path, "s", p.read_bytes(), "lead", off, 0)
+    # a nudge that lands the last take half a sample past a sample boundary must not overflow
+    studio.update_take(tmp_path, "s", t["id"], {"nudge_ms": 0.0113})
+    with pytest.raises(ValueError):
+        studio.update_take(tmp_path, "s", t["id"], {"gain_db": "nan"})
+    tr = studio.build_tracks(tmp_path, "s")
+    assert audio_io.load(tr["lead"])[0].shape[-1] > 3 * 48000 - 10
+
+
+def test_preset_overrides_out_of_range_are_refused():
+    with pytest.raises(ValueError):
+        get_preset("pop", ceiling_dbtp=1.0)
+    with pytest.raises(ValueError):
+        get_preset("pop", target_lufs=-50.0)
+    assert get_preset("pop", target_lufs=-9.0, ceiling_dbtp=-1.0).target_lufs == -9.0

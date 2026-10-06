@@ -35,6 +35,45 @@ def noise_print(power: np.ndarray, frame_active: np.ndarray | None) -> np.ndarra
     return np.median(quiet, axis=1) * 1.44 + 1e-20
 
 
+_BLOCK_FRAMES = 1024  # frames per processing block: bounded memory however long the song is
+
+
+class _Stft:
+    """Hann-window STFT computed and resynthesised block by block (75% overlap, weighted
+    overlap-add). The same transform as scipy's stft/istft pair, without ever holding the whole
+    song's spectrogram - a 4-minute vocal stays at a few MB instead of gigabytes."""
+
+    def __init__(self, x: np.ndarray, nper: int, hop: int):
+        self.nper, self.hop, self.n = nper, hop, x.shape[-1]
+        half = nper // 2
+        xp = np.pad(x, ((0, 0), (half, half)), mode="reflect" if x.shape[-1] > half else "constant")
+        extra = (-(xp.shape[-1] - nper)) % hop
+        self.xp = np.pad(xp, ((0, 0), (0, extra)))
+        self.frames = (self.xp.shape[-1] - nper) // hop + 1
+        self.win = signal.get_window("hann", nper)
+
+    def blocks(self):
+        for i0 in range(0, self.frames, _BLOCK_FRAMES):
+            yield i0, min(self.frames, i0 + _BLOCK_FRAMES)
+
+    def spectrum(self, i0: int, i1: int) -> np.ndarray:
+        """(channels, bins, frames) spectrum of frames [i0, i1)."""
+        seg = self.xp[:, i0 * self.hop: (i1 - 1) * self.hop + self.nper]
+        fr = np.lib.stride_tricks.sliding_window_view(seg, self.nper, axis=-1)[:, :: self.hop]
+        return np.fft.rfft(fr * self.win, axis=-1).transpose(0, 2, 1)
+
+    def overlap_add(self, out: np.ndarray, norm: np.ndarray, i0: int, Z: np.ndarray) -> None:
+        fr = np.fft.irfft(Z.transpose(0, 2, 1), self.nper, axis=-1) * self.win
+        w2 = self.win ** 2
+        for k in range(fr.shape[1]):
+            a = (i0 + k) * self.hop
+            out[:, a: a + self.nper] += fr[:, k]
+            norm[a: a + self.nper] += w2
+
+    def frame_times(self, sr: int) -> np.ndarray:
+        return np.arange(self.frames) * self.hop / sr
+
+
 def denoise(x: np.ndarray, sr: int, active: np.ndarray | None = None, floor_db: float | None = None,
             alpha: float = 0.98, max_reduction_db: float = 15.0, beta: float | None = None) -> tuple[np.ndarray, dict]:
     """Reduce stationary background noise of a (channels, n) vocal. Returns (out, stats).
@@ -45,15 +84,17 @@ def denoise(x: np.ndarray, sr: int, active: np.ndarray | None = None, floor_db: 
     """
     nper = int(2 ** np.round(np.log2(sr * 0.043)))  # ~43 ms
     hop = nper // 4
-    f, t, Z = signal.stft(x, sr, nperseg=nper, noverlap=nper - hop, boundary="even", padded=True)
-    Zm = Z if Z.ndim == 2 else Z.mean(axis=0)
-    power = np.abs(Zm) ** 2
+    st = _Stft(np.atleast_2d(x), nper, hop)
+    # pass 1: the (channel-averaged) power spectrogram, float32 - enough for the noise print
+    power = np.empty((nper // 2 + 1, st.frames), dtype=np.float32)
+    for i0, i1 in st.blocks():
+        power[:, i0:i1] = np.abs(st.spectrum(i0, i1).mean(axis=0)) ** 2
 
     frame_active = None
     if active is not None:
-        idx = np.clip((t * sr).astype(int), 0, len(active) - 1)
+        idx = np.clip((st.frame_times(sr) * sr).astype(int), 0, len(active) - 1)
         frame_active = active[idx]
-    N = noise_print(power, frame_active)
+    N = noise_print(power, frame_active).astype(np.float64)
 
     # is there anything worth removing? (signal-to-noise of the performance)
     sig = power[:, frame_active].mean() if frame_active is not None and frame_active.any() else power.mean()
@@ -71,24 +112,30 @@ def denoise(x: np.ndarray, sr: int, active: np.ndarray | None = None, floor_db: 
         # fidelity (SDR) on the benchmark while removing 6-13 dB of noise.
         beta = float(np.interp(snr_db, [15.0, 20.0], [0.75, 0.5]))
     floor = 10 ** (floor_db / 20)
-    gamma = power / N[:, None]
-    G = np.empty_like(gamma)
+
+    # pass 2: decision-directed Wiener gain frame by frame, applied and resynthesised per block
+    out = np.zeros(st.xp.shape)
+    norm = np.zeros(st.xp.shape[-1])
     g_prev = np.ones(len(N))
     gam_prev = np.ones(len(N))
-    for i in range(gamma.shape[1]):
-        xi = alpha * (g_prev ** 2) * gam_prev + (1 - alpha) * np.maximum(gamma[:, i] - 1.0, 0.0)
-        g = (xi / (1.0 + xi)) ** beta
-        g = np.maximum(g, floor)
-        G[:, i] = g
-        g_prev, gam_prev = g, gamma[:, i]
-    # light smoothing across frequency: removes isolated single-bin "chirps"
-    G = np.maximum(uniform_filter1d(G, 3, axis=0), floor)
-    Zout = Z * (G if Z.ndim == 2 else G[None, :, :])
-    _, y = signal.istft(Zout, sr, nperseg=nper, noverlap=nper - hop, boundary=True)
-    y = np.atleast_2d(y)[:, : x.shape[-1]]
-    if y.shape[-1] < x.shape[-1]:
-        y = np.pad(y, ((0, 0), (0, x.shape[-1] - y.shape[-1])))
-    stats.update(applied=True, noise_floor_reduction_db=round(float(10 * np.log10(np.mean(G[:, ~frame_active] ** 2)))
-                                                           if frame_active is not None and (~frame_active).any()
-                                                           else 0.0, 1))
-    return y, stats
+    quiet_g2, quiet_n = 0.0, 0
+    for i0, i1 in st.blocks():
+        gamma = power[:, i0:i1] / N[:, None]
+        G = np.empty_like(gamma, dtype=np.float64)
+        for i in range(gamma.shape[1]):
+            xi = alpha * (g_prev ** 2) * gam_prev + (1 - alpha) * np.maximum(gamma[:, i] - 1.0, 0.0)
+            g = np.maximum((xi / (1.0 + xi)) ** beta, floor)
+            G[:, i] = g
+            g_prev, gam_prev = g, gamma[:, i]
+        # light smoothing across frequency: removes isolated single-bin "chirps"
+        G = np.maximum(uniform_filter1d(G, 3, axis=0), floor)
+        if frame_active is not None:
+            q = ~frame_active[i0:i1]
+            quiet_g2 += float(np.sum(G[:, q] ** 2))
+            quiet_n += int(q.sum()) * G.shape[0]
+        st.overlap_add(out, norm, i0, st.spectrum(i0, i1) * G[None])
+    half = nper // 2
+    y = out[:, half: half + x.shape[-1]] / np.maximum(norm[half: half + x.shape[-1]], 1e-10)
+    stats.update(applied=True, noise_floor_reduction_db=round(float(10 * np.log10(quiet_g2 / quiet_n)), 1)
+                 if quiet_n else 0.0)
+    return y.reshape(x.shape) if x.ndim == 1 else y, stats
