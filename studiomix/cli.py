@@ -155,7 +155,7 @@ def master_main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="studiomix master",
         description="Turn a finished or rough stereo mix into verified, release-ready masters. "
-                    "(Auto-tune needs separate vocal files - use the main command for that.)",
+                    "With --ai-remix the AI pulls the vocal out first, so it is re-tuned and re-mixed too.",
         epilog="presets:\n" + "\n".join(f"  {p.name:10s} {p.description}" for p in PRESETS.values()),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -175,6 +175,11 @@ def master_main(argv: list[str]) -> int:
                     help="extra verified versions: " + ", ".join(DELIVERY_PROFILES))
     ap.add_argument("--profile", metavar="NAME", help="master toward a learned reference profile")
     ap.add_argument("--no-previews", action="store_true", help="skip the listen-like-a-fan previews")
+    ap.add_argument("--ai-remix", action="store_true",
+                    help="AI: pull the vocal and the beat apart, then re-tune, re-mix and master "
+                         "(needs onnxruntime; about real time on a 4-core computer)")
+    ap.add_argument("--key", help="song key for the re-tune with --ai-remix, e.g. 'F# minor'")
+    ap.add_argument("--best", action="store_true", help="with --ai-remix: slower, marginally cleaner separation")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
     from pathlib import Path
@@ -193,14 +198,56 @@ def master_main(argv: list[str]) -> int:
 
             prof = profiles.load(a.profile)
             preset = profiles.apply(prof, preset, keep_loudness=a.target_lufs is not None)
-        log = master_mix(a.mix, a.out, preset, name=a.name, reference_path=a.reference,
-                         vocal_lift_db=a.vocal_lift, ceiling_overridden=a.ceiling_dbtp is not None,
-                         deliver_extra=extra, verbose=not a.quiet, profile=prof,
-                         previews=not a.no_previews)
+        if a.ai_remix:
+            from .engine import ai_remix
+
+            log = ai_remix(a.mix, a.out, preset, name=a.name, verbose=not a.quiet, best=a.best,
+                           reference_path=a.reference, ceiling_overridden=a.ceiling_dbtp is not None,
+                           deliver_extra=extra, profile=prof, previews=not a.no_previews, key=a.key)
+        else:
+            log = master_mix(a.mix, a.out, preset, name=a.name, reference_path=a.reference,
+                             vocal_lift_db=a.vocal_lift, ceiling_overridden=a.ceiling_dbtp is not None,
+                             deliver_extra=extra, verbose=not a.quiet, profile=prof,
+                             previews=not a.no_previews)
     except (FileNotFoundError, ValueError, RuntimeError, KeyError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     _print_summary(log, a.out)
+    return 0
+
+
+def separate_main(argv: list[str]) -> int:
+    from .ai import separate as sep
+
+    ap = argparse.ArgumentParser(
+        prog="studiomix separate",
+        description="AI source separation (MDX-Net models, CPU, downloaded once).\n"
+                    + "\n".join(f"  {k:13s} {m.about}" for k, m in sep.MODELS.items()),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("files", nargs="+", help="songs (or a vocal, for --what dereverb)")
+    ap.add_argument("--what", choices=list(sep.MODELS), default="vocals",
+                    help="vocals: vocal + instrumental (default); instrumental: cleanest beat; "
+                         "dereverb: dry vocal + its reverb")
+    ap.add_argument("-o", "--out", default="out")
+    ap.add_argument("--best", action="store_true", help="twice as slow, ~0.05 dB cleaner (measured)")
+    a = ap.parse_args(argv)
+    from pathlib import Path
+
+    from . import audio_io
+
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        for f_ in a.files:
+            x, sr = audio_io.load(f_)
+            print(f"{Path(f_).name}: separating ({a.what})...", flush=True)
+            for stem, y in sep.separate(x, sr, a.what, fast=not a.best).items():
+                p = out / f"{Path(f_).stem}_{stem}.wav"
+                audio_io.write_wav(p, y, sr, 24)
+                print(f"  {p}")
+    except (FileNotFoundError, RuntimeError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -258,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
         return serve_main(argv[1:])
     if argv and argv[0] == "master":
         return master_main(argv[1:])
+    if argv and argv[0] == "separate":
+        return separate_main(argv[1:])
     if argv and argv[0] == "doctor":
         from .doctor import main as doctor_main
 

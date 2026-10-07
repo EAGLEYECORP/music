@@ -885,3 +885,47 @@ def test_web_serves_byte_ranges(tmp_path):
         r = c.getresponse(); assert r.status == 200 and r.getheader("Accept-Ranges") == "bytes" and len(r.read()) == p.stat().st_size
     finally:
         srv.shutdown()
+
+
+def _mdx_ready():
+    from studiomix.ai import separate as sep
+
+    p = sep.model_dir() / f"{sep.MODELS['vocals'].file}.onnx"
+    return sep.available() and p.exists()
+
+
+@pytest.mark.skipif(not _mdx_ready(), reason="needs onnxruntime and the Kim_Vocal_2 model (no downloads in tests)")
+def test_ai_separation_spectrogram_roundtrip_and_quality():
+    from scipy import signal as sg
+
+    from studiomix.ai import separate as sep
+
+    eng = sep._Mdx(sep.MODELS["vocals"], sep.fetch(sep.MODELS["vocals"]))
+    x = np.random.default_rng(0).standard_normal((2, eng.chunk))
+    x = sg.sosfiltfilt(sg.butter(8, 20000, fs=44100, output="sos"), x)[None].astype(np.float32)
+    y = eng._istft(eng._stft(x))
+    assert np.max(np.abs(y[..., 4000:-4000] - x[..., 4000:-4000])) < 1e-3  # STFT front end is exact
+
+    v = make_demo.vocal(44100, 12.0)
+    b = make_demo.beat(44100, 12.0)
+    n = min(v.shape[-1], b.shape[-1])
+    v, b = np.vstack([v[0], v[0]])[:, :n] * 0.5, b[:, :n]
+    out = sep.separate(v + b, 44100, "vocals", say=lambda m: None)
+    sdr = lambda ref, est: 10 * np.log10(np.sum(ref ** 2) / np.sum((ref - est) ** 2))  # noqa: E731
+    assert sdr(v, out["vocals"]) > 8.0 and sdr(b, out["instrumental"]) > 20.0  # baseline: -17.8 dB
+    assert np.allclose(out["vocals"] + out["instrumental"], v + b)
+
+
+@pytest.mark.skipif(not _mdx_ready(), reason="needs onnxruntime and the Kim_Vocal_2 model (no downloads in tests)")
+def test_ai_remix_of_a_finished_song(tmp_path):
+    from studiomix.engine import ai_remix
+
+    v = make_demo.vocal(48000, 12.0)
+    b = make_demo.beat(48000, 12.0)
+    n = min(v.shape[-1], b.shape[-1])
+    song = tmp_path / "song.wav"
+    audio_io.write_wav(song, np.vstack([v[0], v[0]])[:, :n] * 0.5 + b[:, :n], 48000)
+    log = ai_remix(song, tmp_path / "out", get_preset("trap"), name="s", verbose=False, previews=False)
+    assert {"ai_vocals", "ai_instrumental", "master_24bit"} <= set(log["files"])
+    assert log["ai_remix"]["model"] == "Kim_Vocal_2" and abs(log["output"]["integrated_lufs"] + 8.5) < 0.1
+    assert "AI remix" in (tmp_path / "out" / "s_report.txt").read_text()

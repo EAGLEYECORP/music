@@ -55,6 +55,7 @@ def run(
     deliver_extra: list[str] | None = None,
     profile: dict | None = None,
     previews: bool = True,
+    original: np.ndarray | None = None,
 ) -> dict:
     t0 = time.time()
 
@@ -216,10 +217,55 @@ def run(
         premaster = _park(mix, spill / "premaster.npy")
         del mix
         return deliver(pre, premaster, sr, preset, name, out_dir, log, say, t0, ceiling_overridden, stems,
-                       deliver_extra, fan_mix=premaster if previews else None, fan_mix_label="Before mastering")
+                       deliver_extra, fan_mix=(None if not previews else premaster if original is None
+                                               else _fit(effects.to_stereo(original), premaster.shape[-1])),
+                       fan_mix_label="Before mastering" if original is None else "Your original")
     finally:
         stems = premaster = None
         shutil.rmtree(spill, ignore_errors=True)
+
+
+def _fit(x: np.ndarray, n: int) -> np.ndarray:
+    return x[:, :n] if x.shape[-1] >= n else np.pad(x, ((0, 0), (0, n - x.shape[-1])))
+
+
+def ai_remix(mix_path: str | Path, out_dir: str | Path, preset: Preset, name: str | None = None,
+             verbose: bool = True, progress=None, best: bool = False, **run_kwargs) -> dict:
+    """A finished song in, a re-tuned, re-mixed and re-mastered song out: the AI pulls the vocal
+    and the beat apart, then the full vocal + beat pipeline runs on them (auto-tune, vocal chain,
+    balance, master), and the result is compared with the original in the fan previews."""
+    from .ai import separate as sep
+
+    def say(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+        _say(verbose, msg)
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = name or Path(mix_path).stem
+    x, sr = audio_io.load(mix_path)
+    t0 = time.time()
+    say("AI: pulling the vocal and the beat apart (MDX-Net vocal model, on the CPU)")
+    stems = sep.separate(x, sr, "vocals", say=say, fast=not best)
+    files = {}
+    for stem, key in (("vocals", "ai_vocals"), ("instrumental", "ai_instrumental")):
+        files[key] = f"{name}_{key}_24bit.wav"
+        audio_io.write_wav(out_dir / files[key], stems[stem], sr, 24)
+    took = round(time.time() - t0, 1)
+    del stems
+    # the extracted vocal still carries the original's reverb and delay: add half as much
+    preset = replace(preset, vocal_reverb=preset.vocal_reverb * 0.5, vocal_delay=preset.vocal_delay * 0.5)
+    log = run(out_dir / files["ai_vocals"], out_dir / files["ai_instrumental"], out_dir, preset, name=name,
+              verbose=verbose, progress=progress, original=x if sr == audio_io.working_rate(sr) else
+              audio_io.resample(x, sr, audio_io.working_rate(sr)), **run_kwargs)
+    log["ai_remix"] = {"source": str(mix_path), "model": sep.MODELS["vocals"].file, "separation_seconds": took,
+                       "mode": "best" if best else "fast"}
+    log["files"].update(files)
+    log["processing_seconds"] = round(log["processing_seconds"] + took, 1)
+    (out_dir / f"{name}_report.json").write_text(json.dumps(log, indent=2, default=float))
+    (out_dir / f"{name}_report.txt").write_text(format_report(name, log))
+    return log
 
 
 def _park(x: np.ndarray, path: Path) -> np.ndarray:
@@ -470,10 +516,13 @@ def format_report(name: str, log: dict) -> str:
     if "instrumental" in log:
         head += (f"    Tempo: {log['instrumental'].get('tempo_bpm') or 'n/a'} BPM    "
                  f"Key: {log.get('key', {}).get('key', 'tuning off')}")
+    ai = log.get("ai_remix")
     lines = [
         f"STUDIOMIX MASTER REPORT - {name}" + (f"  ({log['mode']})" if log.get("mode") else ""),
         "=" * 60,
         head,
+        *([f"AI remix: vocal and beat separated from {Path(ai['source']).name} by the {ai['model']} model "
+           f"({ai['mode']}, {ai['separation_seconds']} s), then re-tuned, re-mixed and re-mastered"] if ai else []),
         "",
         "FINAL MASTER",
         f"  Integrated loudness : {o['integrated_lufs']} LUFS   (target {log['master']['target_lufs']})",

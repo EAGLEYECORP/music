@@ -103,6 +103,12 @@ def main(argv: list[str]) -> int:
         report(None if not previews.available() else True, "listen-like-a-fan previews",
                "ready (Ogg Vorbis, Opus, AAC encoders found)" if previews.available() else
                "this ffmpeg lacks the Vorbis/Opus/AAC encoders - masters are unaffected, previews are skipped")
+    from .ai import separate as sep
+
+    report(True if sep.available() else None, "AI features (vocal separation, AI remix)",
+           "ready - models download on first use (~65 MB each)" if sep.available() else
+           ("pip install onnxruntime - Termux usually has no build of it, so use a computer for AI remix / separate"
+            if termux else "optional: pip install onnxruntime"))
     if termux:
         dl = Path.home() / "storage" / "downloads"
         report(dl.is_dir(), "phone storage", f"{dl} -> Downloads" if dl.is_dir() else

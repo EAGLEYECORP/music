@@ -96,7 +96,13 @@ def _run_job(job: dict) -> None:
 
                 prof = profiles.load(o["profile"])
                 job["preset"] = profiles.apply(prof, job["preset"], keep_loudness=o.get("lufs_set", False))
-            if job["mode"] == "mix":
+            if job["mode"] == "mix" and o.get("ai_remix"):
+                from .engine import ai_remix
+
+                log = ai_remix(job["mix"], job["out"], job["preset"], name=job["name"], verbose=False,
+                               progress=progress, reference_path=job.get("reference"),
+                               deliver_extra=o.get("deliver"), profile=prof)
+            elif job["mode"] == "mix":
                 log = master_mix(job["mix"], job["out"], job["preset"], name=job["name"],
                                  reference_path=job.get("reference"), vocal_lift_db=o.get("vocal_lift", 0.0),
                                  deliver_extra=o.get("deliver"), verbose=False, progress=progress, profile=prof)
@@ -121,7 +127,8 @@ def _run_job(job: dict) -> None:
                 job["status"] = "done"
                 job["result"] = {
                     "output": log["output"],
-                    "key": log.get("key", {}).get("key", "—" if job["mode"] == "mix" else "tuning off"),
+                    "key": log.get("key", {}).get("key", "—" if job["mode"] == "mix" and "ai_remix" not in log
+                                                  else "tuning off"),
                     "findings": log.get("diagnosis", {}).get("findings", []),
                     "checks": log["delivery_check"], "files": log["files"],
                     "seconds": log["processing_seconds"],
@@ -402,6 +409,7 @@ class Handler(BaseHTTPRequestHandler):
             "options": {"key": f("key"), "key_changes": f("key_changes") == "on", "harmonies": harmonies,
                         "stack_at": f("stack_at"), "deliver": deliver,
                         "vocal_lift": 2.0 if f("vocal_lift") == "on" else 0.0,
+                        "ai_remix": f("ai_remix") == "on",
                         "profile": f("profile"), "lufs_set": bool(f("lufs"))},
             "started": time.time(),
         }
@@ -427,8 +435,15 @@ def render_page() -> str:
     from . import profiles
 
     profs = "".join(f'<option value="{n}">{n}</option>' for n in profiles.list_profiles())
+    from .ai import separate as sep
+
+    ai_ok = sep.available()
     return (PAGE.replace("{{PRESETS}}", presets).replace("{{VERSION}}", __version__)
-            .replace("{{PROFILES}}", profs).replace("{{TUNE_JS}}", TUNE_JS))
+            .replace("{{PROFILES}}", profs).replace("{{TUNE_JS}}", TUNE_JS)
+            .replace("{{AI_HINT}}", "The AI pulls the vocal out of your song, then it is auto-tuned, re-mixed and "
+                     "mastered. Takes about as long as the song on a computer." if ai_ok else
+                     "Needs a computer (pip install onnxruntime) - not available on this device.")
+            .replace("{{AI_DISABLED}}", "" if ai_ok else "disabled"))
 
 
 def serve_main(argv: list[str]) -> int:
@@ -670,6 +685,7 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
 .edit[hidden] { display: none; }
 #fan[hidden], audio[hidden] { display: none; }
 .seg input:disabled + label { opacity: .35; pointer-events: none; }
+.switch input:disabled + span { opacity: .35; }
 .edit label { display: grid; grid-template-columns: 92px 1fr 64px; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
 .edit output { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
 #diag { margin: 0 0 12px; padding-left: 18px; font-size: 14px; }
@@ -746,7 +762,9 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
     <div class="icon">⭐</div><div><div class="t">Reference song <span class="muted">(optional)</span></div><div class="s">A released track whose sound you want</div></div></label>
   <div class="row"><div><div class="lbl">Bring vocals forward</div><div class="hint">+2 dB presence on the centre (lead vocal)</div></div>
     <label class="switch"><input type="checkbox" name="vocal_lift"><span></span></label></div>
-  <p class="muted" style="margin:6px 2px 0">It checks for clipping, phase, mud, harshness and silence, fixes what it can, then masters. Auto-tune needs the separate vocal (use "Vocal + beat").</p>
+  <div class="row"><div><div class="lbl">AI remix ✨</div><div class="hint" id="aihint">{{AI_HINT}}</div></div>
+    <label class="switch"><input type="checkbox" name="ai_remix" {{AI_DISABLED}}><span></span></label></div>
+  <p class="muted" style="margin:6px 2px 0">It checks for clipping, phase, mud, harshness and silence, fixes what it can, then masters. With AI remix, the vocal is pulled out of the song first, so it gets auto-tuned and re-mixed too.</p>
 </section>
 
 <section class="m-stems">
@@ -875,6 +893,8 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
 <script>
 const $ = s => document.querySelector(s);
 const LABELS = {master_24bit: ["Master · 24-bit WAV", "upload this to your distributor"],
+  ai_vocals: ["AI-separated vocal", "pulled out of your song by the AI"],
+  ai_instrumental: ["AI-separated beat", "your song without the vocal"],
   master_16bit_cd: ["Master · 16-bit 44.1k WAV", "CD quality / distributors that need 16-bit"],
   mp3_preview: ["Preview · MP3 320k", "for sharing, not for stores"],
   premaster_mix: ["Mix before mastering", "for a mastering engineer"],
