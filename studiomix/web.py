@@ -1085,8 +1085,11 @@ const Studio = (() => {
       const css = getComputedStyle(document.documentElement);
       g.clearRect(0, 0, W, H);
       const a = (t.trim_start_s || 0) / t.duration_s * W, b = W - (t.trim_end_s || 0) / t.duration_s * W;
+      // drawn relative to the take's own peak (up to 10x): a normal phone take is quiet in absolute
+      // terms and would look like a flat line; the "very quiet" warning covers real level problems
+      const top = Math.max(0.1, ...pk);
       for (let i = 0; i < W; i++) {
-        const h = Math.max(1, pk[i] * H);
+        const h = Math.max(1, pk[i] / top * H * 0.95);
         g.fillStyle = (i >= a && i <= b) ? css.getPropertyValue("--accent") : css.getPropertyValue("--line");
         g.fillRect(i, (H - h) / 2, 1, h);
       }
@@ -1299,7 +1302,7 @@ async function poll(id) {
     li.querySelector(".m").textContent = s.msg; ol.appendChild(li);
   });
   $("#pbar").style.width = Math.min(95, 15 + (j.log || []).length / STEPS_EST * 80) + "%";
-  if (j.status === "queued") $("#ptitle").textContent = "Waiting for the previous song to finish";
+  $("#ptitle").textContent = j.status === "queued" ? "Waiting for the previous song to finish" : "Mixing & mastering";
   if (j.status === "error") return fail("Something went wrong: " + j.error);
   if (j.status !== "done") return setTimeout(() => poll(id), 1000);
   $("#pbar").style.width = "100%"; $("#ptitle").textContent = "Finished in " + j.result.seconds + "s";

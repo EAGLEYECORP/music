@@ -4,6 +4,113 @@ Give it a **lead vocal**, optional **ad-libs**, and an **instrumental**. You get
 and mastered song that is ready to upload to Spotify, Apple Music, YouTube, TikTok, or any
 distributor (DistroKid, TuneCore, CD Baby…). It runs on a computer or on an Android phone (Termux).
 
+<p align="center">
+  <img src="docs/screenshots/1-upload.png" width="24%" alt="Upload your vocals and beat">
+  <img src="docs/screenshots/2-record.png" width="24%" alt="Record on the phone with live auto-tune in your earbuds">
+  <img src="docs/screenshots/4-listen-like-a-fan.png" width="24%" alt="Listen like a fan: Spotify, Apple Music, YouTube, phone speaker">
+  <img src="docs/screenshots/5-checks-and-files.png" width="24%" alt="Every release check, then the files to upload">
+</p>
+<p align="center"><sub>Upload or record → it mixes and masters → hear it like your fans will → upload the master.</sub></p>
+
+## Step by step: get it running
+
+### On an Android phone
+
+**1. Install Termux.** Get it from **F-Droid** ([f-droid.org/packages/com.termux](https://f-droid.org/packages/com.termux/)).
+The Play Store version is outdated and won't work.
+
+**2. Install studiomix.** Open Termux and type these lines one by one (press Enter after each):
+
+```bash
+pkg install -y git
+git clone https://github.com/EAGLEYECORP/music
+cd music
+bash scripts/termux-setup.sh
+```
+
+Accept the popup that asks for access to your files. Setup takes 5–10 minutes. Nothing is
+compiled, it downloads ready-made packages. If the repository is private, `git clone` asks for
+your GitHub username and a password. The password is a **personal access token**, not your
+GitHub password: GitHub → Settings → Developer settings → Personal access tokens → *Generate new
+token (classic)*, tick **repo**, then paste the token when Termux asks.
+
+**3. Check it works.** At the end, setup runs `studiomix doctor` by itself. You want to see
+`All good`. It also tells you how long a 3-minute song takes on *your* phone. Anything that says
+`FAIL` comes with the command that fixes it.
+
+**4. Start the app.**
+
+```bash
+studiomix serve
+```
+
+The app opens in your phone's browser. If it doesn't, open Chrome and go to
+**http://127.0.0.1:8765**. Leave Termux running in the background. Tip: run `termux-wake-lock`
+first, so Android doesn't pause it while it works.
+
+**5. Make a song.** Pick one of the three tabs at the top:
+
+| tab | use it when |
+|---|---|
+| 🎙️ **Record** | you want to record your vocals on the phone, over the beat, with earbuds |
+| 🎤 **Upload vocals** | you have the vocal (and ad-libs) and the beat as separate files |
+| 🎚️ **Finished mix** | you have one file with everything already together and only want it mastered |
+
+Choose the style (trap, hip-hop, pop…), then tap **Mix & master**.
+
+**6. Listen, then upload.** When it's done:
+
+- **Listen like a fan:** tap **Spotify / Apple / YouTube / Phone** to hear it exactly the way
+  each app will play it. Switch to **Before mastering** to hear the difference.
+- **The checks:** a green ✓ means it's ready for the stores. A `!` explains what to look at.
+- **Download "Master · 24-bit WAV"** and upload that file to DistroKid, TuneCore, CD Baby or
+  your distributor. Everything is also saved in **Downloads/studiomix** on the phone.
+
+**Next time,** open Termux and type `cd music && studiomix serve`. To get the latest version:
+`cd music && git pull`.
+
+### On a computer (Windows, Mac, Linux)
+
+1. Install **Python 3.10+** ([python.org](https://www.python.org/downloads/); on Windows tick
+   *"Add Python to PATH"*) and **ffmpeg** ([ffmpeg.org](https://ffmpeg.org/download.html);
+   Mac: `brew install ffmpeg`).
+2. In a terminal:
+
+   ```bash
+   git clone https://github.com/EAGLEYECORP/music
+   cd music
+   pip install -e .
+   studiomix doctor
+   studiomix serve
+   ```
+
+3. Your browser opens the same app. Same steps as on the phone from step 5.
+
+### If something goes wrong
+
+| problem | fix |
+|---|---|
+| `studiomix: command not found` | setup didn't finish: `cd music && bash scripts/termux-setup.sh` and read the last lines it prints |
+| the browser didn't open | open **http://127.0.0.1:8765** yourself |
+| "no access" to Downloads | run `termux-setup-storage` and accept the popup |
+| it stops when the screen turns off | run `termux-wake-lock` before `studiomix serve` |
+| very slow, or Termux closes | close other apps; `studiomix doctor` shows free memory and the expected time |
+| recording sounds muffled | you're recording through Bluetooth earbuds; use the phone's mic or wired earbuds |
+| you hear yourself late in the earbuds | that's Bluetooth delay: use wired earbuds for *Hear yourself* |
+| anything else | run `studiomix doctor` and read the `FAIL` lines |
+
+### The screens
+
+| | |
+|---|---|
+| <img src="docs/screenshots/1-upload.png" width="300"> | **Upload vocals.** Lead, beat and ad-libs, then the style, auto-tune, harmonies and doubles. |
+| <img src="docs/screenshots/2-record.png" width="300"> | **Record.** Your song is saved on the phone. Calibrate your earbuds once, tap REC, sing. *Hear yourself* puts your voice in your earbuds already auto-tuned to the beat's key. Every take is kept: ★ the best one, trim it, nudge it. |
+| <img src="docs/screenshots/3-progress.png" width="300"> | **While it works.** Each step as it happens. |
+| <img src="docs/screenshots/4-listen-like-a-fan.png" width="300"> | **Listen like a fan.** The master the way Spotify, Apple Music, YouTube and a phone speaker play it, A/B'd against the mix before mastering. |
+| <img src="docs/screenshots/5-checks-and-files.png" width="300"> | **Checks and files.** Loudness, true peak, clipping (checked on the files actually written, with two independent meters, and after Spotify's encoder), then the files to upload. |
+
+## Command line
+
 ```bash
 studiomix vocal.wav beat.wav --adlibs adlibs.wav --preset trap --name "My Song"
 ```
