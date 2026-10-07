@@ -18,7 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 fast = ["numba>=0.58"]          # JIT for the dynamics loops (desktop; not available on Termux)
 formats = ["soundfile>=0.12"]   # decode flac/ogg/mp3 without ffmpeg
-ai = ["onnxruntime>=1.16"]       # AI vocal separation / AI remix (computer; models download on first use)
+ai = ["onnxruntime>=1.16", "sherpa-onnx>=1.10"]  # AI separation / remix / lyrics (computer; models download on first use)
 dev = ["pytest>=7"]
 
 [project.scripts]

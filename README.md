@@ -79,7 +79,7 @@ Choose the style (trap, hip-hop, pop…), then tap **Mix & master**.
    ```bash
    git clone https://github.com/EAGLEYECORP/music
    cd music
-   pip install -e .
+   pip install -e ".[ai]"      # or: pip install -e .   (without the AI features)
    studiomix doctor
    studiomix serve
    ```
@@ -108,6 +108,7 @@ Choose the style (trap, hip-hop, pop…), then tap **Mix & master**.
 | <img src="docs/screenshots/3-progress.png" width="300"> | **While it works.** Each step as it happens. |
 | <img src="docs/screenshots/4-listen-like-a-fan.png" width="300"> | **Listen like a fan.** The master the way Spotify, Apple Music, YouTube and a phone speaker play it, A/B'd against the mix before mastering. |
 | <img src="docs/screenshots/5-checks-and-files.png" width="300"> | **Checks and files.** Loudness, true peak, clipping (checked on the files actually written, with two independent meters, and after Spotify's encoder), then the files to upload. |
+| <img src="docs/screenshots/6-engineer.png" width="300"> | **The engineer.** What it changed for your words, notes on the mix with one-tap fixes, and *Redo with these changes*. |
 
 ## Command line
 
@@ -164,6 +165,109 @@ master's ceiling, so it would grade the encoder, not your master.)
 It needs ffmpeg with the Vorbis, Opus and AAC encoders (the Termux package has them; `studiomix
 doctor` tells you). It adds about 30 s per 3-minute song on a computer and more on a phone, and
 `studiomix doctor`'s time estimate includes it. `--no-previews` skips it.
+
+## AI features
+
+| | what it does | where it runs |
+|---|---|---|
+| **The engineer** | You say what you want in plain words, English or French, and it changes the mix. It also leaves notes on every mix, each with a one-tap fix. | everywhere, phone included |
+| **AI remix** | Drop in a finished song. The AI pulls the vocal and the beat apart, then the vocal is auto-tuned, re-mixed and mastered. | computer |
+| **AI separation** | Vocal / instrumental, drums / bass / other of a beat, de-reverb of a vocal. | computer |
+| **Lyrics → captions** | `.srt` captions for TikTok / Reels / YouTube and `.lrc` synced lyrics, from your vocal. | computer |
+
+On a computer, install them once with `pip install -e ".[ai]"`. The models (30–375 MB each)
+download on first use into `~/.studiomix/models`. Termux usually has no build of the AI runtime,
+so on the phone you get the engineer, and `studiomix doctor` tells you what's available.
+
+### The engineer
+
+<img src="docs/screenshots/6-engineer.png" width="300" align="right" alt="Engineer notes with one-tap fixes">
+
+Type what you want in *Tell the engineer*, or after a mix in *Not quite? Say what to change*:
+
+```
+more 808, vocal a bit less harsh, way more reverb
+voix plus forte, trop de reverb, 808 sur téléphone
+```
+
+- **Strength words scale the change:** "a bit" / "un peu" is half, "way more" / "beaucoup" is
+  one and a half.
+- **Complaints are turned around:** "too much reverb" / "trop de reverb" means less reverb.
+- **Every change is listed back** with its amount, and anything it couldn't place is named.
+  Nothing changes behind your back.
+- **Redo** keeps the same song and adds your changes on top: `My Song_v2`, `_v3`…
+- On the command line: `--ask "louder, wider, 808 on phones"`.
+
+It understands: the 808 / bass, kick / drums, vocal level, harsh / sibilant, dull / muffled,
+reverb, dry, delay, room echo, hard / natural / no auto-tune, ad-lib level, width, punch,
+loudness, darker / brighter, doubles and noise.
+
+It is a fixed, readable rulebook, not a chatbot. That's why it works offline on a phone and why
+its answers are predictable.
+
+**Engineer notes.** After every mix it listens to the master and the stems and tells you, with
+numbers and times, when:
+- the vocal sinks under the beat (where, and by how much),
+- the ad-libs cover the lead,
+- the low end is sub-bass a phone can't play,
+- or the master is over-squashed.
+
+Each note has a **Fix** button with the request that fixes it.
+
+**808 on phones.** A phone speaker plays nothing near an 808's fundamental. On test songs the
+sub-bass sat 38 dB under everything else on a phone. *808 on phones* adds the 808's overtones
+(bass harmonics), which phones can play: on a beat, the 808's share of what a phone plays goes
+from -35.6 dB to -12.9 dB.
+
+### AI remix and separation
+
+```bash
+studiomix master song.wav -p trap --ai-remix --key "A minor"    # or the AI remix toggle in Finished mix
+studiomix separate song.wav                                     # vocals + instrumental
+studiomix separate beat.wav --what beat                         # drums + bass + other
+studiomix separate vocal.wav --what dereverb                    # dry vocal + its room reverb
+```
+
+- **The models:** MDX-Net networks from the open Ultimate Vocal Remover collection and KUIELab,
+  run with onnxruntime on the CPU (no PyTorch, no GPU).
+- **The spectrogram maths is verified exact:** forward then inverse returns the input to 4e-5.
+- **Measured on real music** (a Maes vocal over a Heartless instrumental): the vocal comes back at
+  13.2 dB SDR and the instrumental at 16.3 dB, starting from -3 dB.
+- **Speed:** about real time on 4 cores. The reference implementation's second pass measured only
+  0.05 dB better for twice the time, so it's optional (`--best`).
+- **The AI remix compares itself with your original song** in *Listen like a fan*, and the
+  separated vocal and beat are also downloads.
+- **With the AI installed,** "more 808" turns up the real AI-split bass, and "kick harder" the real
+  drums. Without it, the 808 falls back to an EQ shelf.
+
+### Lyrics → captions
+
+```bash
+studiomix lyrics vocal.wav --lang en          # or a full song: --song (separates the vocal first)
+studiomix vocal.wav beat.wav --lyrics fr      # captions next to the master
+```
+
+- **How it works:** Whisper (int8, via sherpa-onnx) transcribes the vocal, cut where it is
+  actually sung. Caption lines break where a sung line starts.
+- **Output:** `.srt` (video captions), `.lrc` (synced lyrics) and `.txt`.
+- **Measured on real vocals:**
+  - Whisper *small* gets sung English mostly right ("…'cause I'm heartless / All this money and
+    this pain got me heartless").
+  - Fast French rap comes out as a rough draft.
+  - *base* failed on sung English, so *small* is the default.
+- **Treat it as a draft to correct.** Line timing inside a long phrase is approximate.
+
+### Not built, and why
+
+- **Voice cloning / sounding like a real artist:** it can't be done on a phone, and using a real
+  person's voice without consent is a legal and ethical problem. Doubles, harmonies and the
+  stack are built from *your* voice instead.
+- **Automatic genre detection:** there was no labelled data here to check it against. A wrong
+  guess would silently change the whole sound, so you pick the style, or teach it one with
+  `studiomix learn`.
+- **An AI pitch tracker:** the built-in tracker is already measured on real voices (see
+  `tools/eval_real_voices.py`). Swapping it without a better measurement would be change for
+  its own sake.
 
 ## Already have a mix? Master it
 
