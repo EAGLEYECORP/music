@@ -225,6 +225,25 @@ def run(
         shutil.rmtree(spill, ignore_errors=True)
 
 
+def add_lyrics(log: dict, vocal_path: str | Path, out_dir: str | Path, name: str, lang: str = "",
+               size: str = "small", say=print) -> None:
+    """Captions (.srt), synced lyrics (.lrc) and text from the vocal, added to the delivered files.
+    A bonus: a failure here is reported, never fatal to the master."""
+    try:
+        from .ai import lyrics
+
+        say("lyrics: transcribing the vocal (Whisper " + size + ") for captions")
+        v, sr = audio_io.load(vocal_path)
+        lines = lyrics.transcribe(v, sr, lang, size, say)
+        files = lyrics.write(lines, Path(out_dir) / f"{name}_lyrics")
+        log["files"].update({f"lyrics_{k}": p.name for k, p in files.items()})
+        log["lyrics"] = {"lines": len(lines), "model": f"whisper-{size}", "language": lang or "auto"}
+        (Path(out_dir) / f"{name}_report.json").write_text(json.dumps(log, indent=2, default=float))
+    except Exception as e:
+        log["lyrics_error"] = str(e)
+        say(f"lyrics skipped: {e}")
+
+
 def _fit(x: np.ndarray, n: int) -> np.ndarray:
     return x[:, :n] if x.shape[-1] >= n else np.pad(x, ((0, 0), (0, n - x.shape[-1])))
 

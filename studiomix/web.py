@@ -123,6 +123,13 @@ def _run_job(job: dict) -> None:
                     stack_at=parse_time_ranges(o.get("stack_at")), verbose=False, progress=progress,
                     deliver_extra=o.get("deliver"), profile=prof,
                 )
+            if o.get("lyrics"):
+                from .engine import add_lyrics
+
+                src = (Path(job["out"]) / log["files"]["ai_vocals"] if "ai_vocals" in log["files"]
+                       else job.get("lead"))
+                if src:
+                    add_lyrics(log, src, job["out"], job["name"], say=progress)
             with _jobs_lock:
                 job["status"] = "done"
                 job["result"] = {
@@ -301,7 +308,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {"error": "no such file"})
             path = Path(job["out"]) / fname
             ctype = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
-                     ".json": "application/json", ".txt": "text/plain; charset=utf-8"}.get(path.suffix,
+                     ".json": "application/json", ".txt": "text/plain; charset=utf-8",
+                     ".srt": "text/plain; charset=utf-8", ".lrc": "text/plain; charset=utf-8"}.get(path.suffix,
                                                                                              "application/octet-stream")
             return self._send_file(path, ctype, {"Content-Disposition": f'inline; filename="{fname}"'})
         return self._json(404, {"error": "not found"})
@@ -450,6 +458,7 @@ class Handler(BaseHTTPRequestHandler):
                         "stack_at": f("stack_at"), "deliver": deliver,
                         "vocal_lift": 2.0 if f("vocal_lift") == "on" else 0.0,
                         "ai_remix": f("ai_remix") == "on",
+                        "lyrics": f("lyrics") == "on",
                         "profile": f("profile"), "lufs_set": bool(f("lufs"))},
             "started": time.time(), "engineer": engineer,
         }
@@ -480,12 +489,19 @@ def render_page() -> str:
     from .ai import separate as sep
 
     ai_ok = sep.available()
+    from .ai import lyrics as lyr
+
+    lyr_ok = lyr.available()
     return (PAGE.replace("{{PRESETS}}", presets).replace("{{VERSION}}", __version__)
             .replace("{{PROFILES}}", profs).replace("{{TUNE_JS}}", TUNE_JS)
             .replace("{{AI_HINT}}", "The AI pulls the vocal out of your song, then it is auto-tuned, re-mixed and "
                      "mastered. Takes about as long as the song on a computer." if ai_ok else
                      "Needs a computer (pip install onnxruntime) - not available on this device.")
-            .replace("{{AI_DISABLED}}", "" if ai_ok else "disabled"))
+            .replace("{{AI_DISABLED}}", "" if ai_ok else "disabled")
+            .replace("{{LYR_HINT}}", "Captions for TikTok / Reels / YouTube (.srt) and synced lyrics (.lrc), "
+                     "transcribed from your vocal - a draft to correct." if lyr_ok else
+                     "Needs a computer (pip install sherpa-onnx) - not available on this device.")
+            .replace("{{LYR_DISABLED}}", "" if lyr_ok else "disabled"))
 
 
 def serve_main(argv: list[str]) -> int:
@@ -830,6 +846,8 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
   <div class="row"><div class="stack"><div class="lbl">Tell the engineer <span class="muted">(optional · English or French)</span></div>
     <input type="text" name="ask" placeholder="e.g. more 808, vocal a bit less harsh" autocomplete="off">
     <div class="hint">Plain words: 808, vocal louder, less harsh, more reverb, dry, hard autotune, ad-libs quieter, wider, punchier, louder, darker… · voix plus forte, trop de reverb</div></div></div>
+  <div class="row"><div><div class="lbl">Lyrics → captions ✨</div><div class="hint">{{LYR_HINT}}</div></div>
+    <label class="switch"><input type="checkbox" name="lyrics" {{LYR_DISABLED}}><span></span></label></div>
   <div class="row"><div class="stack"><div class="lbl">Sound like <span class="muted">(your reference library)</span></div>
     <select name="profile" id="profsel"><option value="">— no reference profile —</option>{{PROFILES}}</select>
     <div class="hint">Matches loudness, tonal balance and stereo width of the songs you taught it</div></div></div>
@@ -952,6 +970,8 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
 const $ = s => document.querySelector(s);
 const LABELS = {master_24bit: ["Master · 24-bit WAV", "upload this to your distributor"],
   ai_vocals: ["AI-separated vocal", "pulled out of your song by the AI"],
+  lyrics_srt: ["Captions · SRT", "for TikTok / Reels / YouTube - a draft to correct"],
+  lyrics_lrc: ["Synced lyrics · LRC", "for music players"], lyrics_txt: ["Lyrics · text", ""],
   ai_instrumental: ["AI-separated beat", "your song without the vocal"],
   master_16bit_cd: ["Master · 16-bit 44.1k WAV", "CD quality / distributors that need 16-bit"],
   mp3_preview: ["Preview · MP3 320k", "for sharing, not for stores"],

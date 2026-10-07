@@ -109,6 +109,12 @@ def main(argv: list[str]) -> int:
            "ready - models download on first use (~65 MB each)" if sep.available() else
            ("pip install onnxruntime - Termux usually has no build of it, so use a computer for AI remix / separate"
             if termux else "optional: pip install onnxruntime"))
+    from .ai import lyrics as lyr
+
+    report(True if lyr.available() else None, "AI lyrics -> captions",
+           "ready - the Whisper model downloads on first use (~375 MB)" if lyr.available() else
+           ("pip install sherpa-onnx - Termux usually has no build of it, so use a computer"
+            if termux else "optional: pip install sherpa-onnx"))
     if termux:
         dl = Path.home() / "storage" / "downloads"
         report(dl.is_dir(), "phone storage", f"{dl} -> Downloads" if dl.is_dir() else

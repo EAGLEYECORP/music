@@ -33,6 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-stems", action="store_true", help="don't export the processed vocal/instrumental stems")
     ap.add_argument("--no-previews", action="store_true",
                     help="skip the listen-like-a-fan previews (Spotify / Apple Music / YouTube / phone speaker)")
+    ap.add_argument("--lyrics", nargs="?", const="auto", metavar="LANG",
+                    help="also write captions (.srt), synced lyrics (.lrc) and text from the vocal "
+                         "(AI, needs sherpa-onnx; LANG e.g. en, fr - default: detect)")
     ap.add_argument("--ask", metavar="WORDS",
                     help='tell the engineer in plain words (English or French), e.g. '
                          '"more 808, vocal a bit less harsh" or "voix plus forte, trop de reverb"')
@@ -195,6 +198,8 @@ def master_main(argv: list[str]) -> int:
     ap.add_argument("--profile", metavar="NAME", help="master toward a learned reference profile")
     ap.add_argument("--no-previews", action="store_true", help="skip the listen-like-a-fan previews")
     ap.add_argument("--ask", metavar="WORDS", help='plain-words changes, e.g. "louder, wider, 808 on phones"')
+    ap.add_argument("--lyrics", nargs="?", const="auto", metavar="LANG",
+                    help="with --ai-remix: captions + synced lyrics from the AI-separated vocal")
     ap.add_argument("--ai-remix", action="store_true",
                     help="AI: pull the vocal and the beat apart, then re-tune, re-mix and master "
                          "(needs onnxruntime; about real time on a 4-core computer)")
@@ -225,6 +230,12 @@ def master_main(argv: list[str]) -> int:
             log = ai_remix(a.mix, a.out, preset, name=a.name, verbose=not a.quiet, best=a.best,
                            reference_path=a.reference, ceiling_overridden=a.ceiling_dbtp is not None,
                            deliver_extra=extra, profile=prof, previews=not a.no_previews, key=a.key)
+            if a.lyrics:
+                from .engine import add_lyrics
+
+                name = a.name or Path(a.mix).stem
+                add_lyrics(log, Path(a.out) / log["files"]["ai_vocals"], a.out, name,
+                           "" if a.lyrics == "auto" else a.lyrics, say=lambda m: print(f"  - {m}"))
         else:
             log = master_mix(a.mix, a.out, preset, name=a.name, reference_path=a.reference,
                              vocal_lift_db=a.vocal_lift, ceiling_overridden=a.ceiling_dbtp is not None,
@@ -269,6 +280,45 @@ def separate_main(argv: list[str]) -> int:
     except (FileNotFoundError, RuntimeError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    return 0
+
+
+def lyrics_main(argv: list[str]) -> int:
+    from .ai import lyrics
+
+    ap = argparse.ArgumentParser(prog="studiomix lyrics",
+                                 description="AI lyrics -> captions (.srt), synced lyrics (.lrc) and text. "
+                                             "Best from the vocal on its own; --song separates it first.")
+    ap.add_argument("file", help="a vocal (or a full song with --song)")
+    ap.add_argument("--song", action="store_true", help="the file is a full song: pull the vocal out first (AI)")
+    ap.add_argument("--lang", default="", help="language, e.g. en, fr (default: detect)")
+    ap.add_argument("--model", default="small", choices=list(lyrics.SIZES),
+                    help="small (default, measured best on sung vocals) / base / tiny (faster, worse)")
+    ap.add_argument("-o", "--out", default="out")
+    a = ap.parse_args(argv)
+    from pathlib import Path
+
+    from . import audio_io
+
+    try:
+        x, sr = audio_io.load(a.file)
+        if a.song:
+            from .ai import separate as sep
+
+            print("pulling the vocal out (AI)...", flush=True)
+            x = sep.separate(x, sr, "vocals")["vocals"]
+        lines = lyrics.transcribe(x, sr, a.lang, a.model)
+    except (FileNotFoundError, RuntimeError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    files = lyrics.write(lines, out / f"{Path(a.file).stem}_lyrics")
+    for ln in lines:
+        print(f"  [{int(ln['start'] // 60)}:{ln['start'] % 60:05.2f}] {ln['text']}")
+    print("a draft to correct - edit the .srt / .lrc in any text editor:")
+    for p in files.values():
+        print(f"  {p}")
     return 0
 
 
@@ -326,6 +376,8 @@ def main(argv: list[str] | None = None) -> int:
         return serve_main(argv[1:])
     if argv and argv[0] == "master":
         return master_main(argv[1:])
+    if argv and argv[0] == "lyrics":
+        return lyrics_main(argv[1:])
     if argv and argv[0] == "separate":
         return separate_main(argv[1:])
     if argv and argv[0] == "doctor":
@@ -381,6 +433,11 @@ def main(argv: list[str] | None = None) -> int:
             key_changes=args.key_changes, stack_at=stack_at, deliver_extra=extra, profile=prof,
             previews=not args.no_previews,
         )
+        if args.lyrics:
+            from .engine import add_lyrics
+
+            add_lyrics(log, args.vocal, args.out, args.name or Path(args.vocal).stem,
+                       "" if args.lyrics == "auto" else args.lyrics, say=lambda m: print(f"  - {m}"))
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

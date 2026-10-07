@@ -998,3 +998,42 @@ def test_engineer_notes_find_a_sinking_vocal(tmp_path, demo_files):
     found = notes.make(tmp_path, log["files"], get_preset("trap"), log["output"])
     sink = [n for n in found if n["ask"] == "vocal louder"]
     assert sink and "0:0" in sink[0]["text"]
+
+
+def test_lyrics_captions_follow_the_singing_and_write_valid_files(tmp_path):
+    from studiomix.ai import lyrics
+
+    sr = 48000
+    v = np.zeros((1, sr * 12))
+    t = np.arange(sr * 3) / sr
+    for start in (1.0, 6.0):  # two sung phrases with silence around them
+        a = int(start * sr)
+        v[0, a:a + len(t)] = 0.3 * np.sin(2 * np.pi * 220 * t) * np.minimum(1, t * 20)
+    ph = [(a / sr, b / sr) for a, b in lyrics.phrases(v, sr)]
+    assert len(ph) == 2 and abs(ph[0][0] - 1.0) < 0.45 and abs(ph[1][0] - 6.0) < 0.45  # captions lead in a little
+    lines = lyrics._caption_lines("I'm back to my ways 'cause I'm heartless All this money and this pain got me "
+                                  "heartless All I've got", 1.0, 9.0)
+    assert all(len(ln["text"]) <= 48 for ln in lines) and lines[0]["start"] == 1.0 and lines[-1]["end"] == 9.0
+    assert lines[1]["text"].startswith("All this money")  # breaks where a sung line starts
+    assert lyrics._clean("[Music] ♪ Heartless ♪") == "Heartless"
+    files = lyrics.write(lines, tmp_path / "s_lyrics")
+    srt = files["srt"].read_text()
+    assert srt.startswith("1\n00:00:01,000 --> ") and "-->" in srt
+    assert files["lrc"].read_text().startswith("[00:01.00]")
+
+
+def _whisper_ready():
+    from studiomix.ai import lyrics, separate
+
+    return lyrics.available() and (separate.model_dir() / "whisper-small" / "small-tokens.txt").exists()
+
+
+@pytest.mark.skipif(not _whisper_ready(), reason="needs sherpa-onnx and the Whisper small model (no downloads in tests)")
+def test_lyrics_transcription_runs():
+    from studiomix.ai import lyrics
+
+    sr = 16000
+    t = np.arange(sr * 3) / sr
+    v = (0.2 * np.sin(2 * np.pi * 200 * t))[None]
+    lines = lyrics.transcribe(v, sr, "en")
+    assert isinstance(lines, list)  # a tone has no words; the point is the model loads and decodes

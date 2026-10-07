@@ -93,7 +93,10 @@ def activity_mask(x: np.ndarray, sr: int, frame_ms: float = 50.0, margin_db: flo
         real = f
     loud = np.percentile(real, 95)
     floor = np.percentile(real, 10)
-    thr = max(floor + 10.0, loud - margin_db, -80.0)
+    # never closer than 6 dB below the loud parts: with digital silence in the gaps (takes on a
+    # timeline, clean studio vocals) the 10th percentile of what is left is the singing itself,
+    # and "floor + 10 dB" would mark most of a steady vocal as silent
+    thr = max(min(floor + 10.0, loud - 6.0), loud - margin_db, -80.0)
     frames = f > thr
     # close tiny gaps (consonants, breaths) with a short dilation
     k = max(1, int(150 / frame_ms))
