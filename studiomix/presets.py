@@ -13,6 +13,7 @@ class Preset:
     # ---- vocal chain
     vocal_hpf_hz: float = 90.0
     vocal_denoise: bool = True          # adaptive background-noise reduction (fans, AC, hiss, hum)
+    vocal_ai_dereverb: bool = False     # AI: remove the room's echo from the vocal (needs onnxruntime)
     vocal_mud_cut_db: float = -2.5      # around 300 Hz
     vocal_boxy_cut_db: float = -1.5     # around 800 Hz
     vocal_presence_db: float = 2.0      # around 3.5 kHz
@@ -50,6 +51,8 @@ class Preset:
     inst_hpf_hz: float = 25.0
     inst_carve_db: float = 3.0          # max dip in the 1.5-5 kHz band while the vocal sings
     inst_low_db: float = 0.0            # low shelf on the beat at 90 Hz (808 / kick weight)
+    inst_bass_db: float = 0.0           # 808 / bass level in the beat (AI-split; low shelf without the AI)
+    inst_drums_db: float = 0.0          # drums level in the beat (AI-split; needs the AI)
     bass_harmonics: float = 0.0         # 0-1: overtones of the sub so the 808 reads on phone speakers
 
     # ---- master
@@ -184,5 +187,7 @@ SAFE_RANGES = {
     "master_width": (0.0, 2.0, "width"),
     "punch": (0.0, 1.0, "punch"),
     "inst_low_db": (-8.0, 8.0, "beat low end (dB)"),
+    "inst_bass_db": (-8.0, 8.0, "808 / bass level (dB)"),
+    "inst_drums_db": (-8.0, 8.0, "drums level (dB)"),
     "bass_harmonics": (0.0, 1.0, "bass harmonics"),
 }

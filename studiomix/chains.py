@@ -53,6 +53,9 @@ def vocal_chain(v: np.ndarray, sr: int, p: Preset, log: dict, key=None, label: s
         else:
             v = v[:2]
 
+    if p.vocal_ai_dereverb:
+        v = _ai_dereverb(v, sr, log)
+
     active, _ = analysis.activity_mask(v, sr)
     log["active_seconds"] = round(active.sum() / sr, 1)
     if active.sum() < sr * 0.5:
@@ -246,6 +249,45 @@ def build_stack(lead: np.ndarray, sr: int, capture: dict, p: Preset, active: np.
 
 # ------------------------------------------------------------------ instrumental
 
+def _ai_dereverb(v: np.ndarray, sr: int, log: dict) -> np.ndarray:
+    """Remove the recording room's reverb (bedroom, bathroom) with the AI de-reverb model; the
+    chain's own reverb is then the only space on the vocal. Skipped (and said) without the AI."""
+    from .ai import separate as sep
+
+    if not sep.available():
+        log["ai_dereverb"] = "needs onnxruntime (pip install onnxruntime) - skipped"
+        return v
+    try:
+        dry = sep.separate(v, sr, "dereverb", say=lambda m: None)["dry"]
+    except Exception as e:
+        log["ai_dereverb"] = f"skipped: {e}"
+        return v
+    log["ai_dereverb"] = "room echo removed (AI)"
+    return np.mean(dry, axis=0, keepdims=True) if v.shape[0] == 1 else dry[: v.shape[0]]
+
+
+def _rebalance_beat(inst: np.ndarray, sr: int, p: Preset, log: dict) -> np.ndarray:
+    """Turn the 808 / the drums of the beat up or down. With the AI installed the beat is split
+    into drums / bass / other and the real stems are moved; without it the 808 falls back to a
+    low shelf at the same amount, and drums can't be moved (said in the log)."""
+    from .ai import separate as sep
+
+    if sep.available():
+        try:
+            st = sep.split_beat(inst, sr, say=lambda m: None)
+            g = lambda db: 10 ** (db / 20)  # noqa: E731
+            log["beat_split"] = {"bass_db": p.inst_bass_db, "drums_db": p.inst_drums_db}
+            return st["other"] + st["bass"] * g(p.inst_bass_db) + st["drums"] * g(p.inst_drums_db)
+        except Exception as e:  # no network for the first download, etc.
+            log["beat_split_error"] = str(e)
+    if p.inst_bass_db:
+        inst = signal.sosfilt(filters.biquad_sos("lowshelf", 90.0, sr, 0.7071, p.inst_bass_db), inst, axis=-1)
+        log["bass_shelf_db"] = p.inst_bass_db
+    if p.inst_drums_db:
+        log["drums_level"] = "needs the AI beat split (pip install onnxruntime) - skipped"
+    return inst
+
+
 def bass_harmonics(x: np.ndarray, sr: int, amount: float) -> np.ndarray:
     """Overtones of the sub-bass (mono): a phone speaker plays nothing below ~300 Hz, so an 808
     vanishes on it - but the ear rebuilds a low note from its overtones (the "missing
@@ -262,6 +304,8 @@ def instrumental_chain(inst: np.ndarray, vocal_dry: np.ndarray, sr: int, active:
                        log: dict) -> np.ndarray:
     inst = effects.to_stereo(inst)
     inst = filters.highpass(inst, sr, p.inst_hpf_hz, order=4)
+    if p.inst_bass_db or p.inst_drums_db:
+        inst = _rebalance_beat(inst, sr, p, log)
     if p.inst_low_db:
         inst = signal.sosfilt(filters.biquad_sos("lowshelf", 90.0, sr, 0.7071, p.inst_low_db), inst, axis=-1)
         log["low_shelf_db"] = p.inst_low_db

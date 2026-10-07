@@ -936,7 +936,8 @@ def test_engineer_understands_plain_words_in_english_and_french():
 
     p = get_preset("trap")
     cases = {  # phrase -> (field, expected sign of the change, or the exact value)
-        "more 808": ("inst_low_db", +1), "le 808 est trop fort": ("inst_low_db", -1),
+        "more 808": ("inst_bass_db", +1), "le 808 est trop fort": ("inst_bass_db", -1),
+        "kick harder": ("inst_drums_db", +1), "moins de batterie": ("inst_drums_db", -1),
         "vocal louder": ("vocal_balance_db", +1), "la voix est trop forte": ("vocal_balance_db", -1),
         "pas assez de voix": ("vocal_balance_db", +1),
         "less harsh": ("vocal_deess_db", +1), "too harsh": ("vocal_deess_db", +1),
@@ -956,9 +957,9 @@ def test_engineer_understands_plain_words_in_english_and_french():
         else:
             assert d * want > 0, (phrase, d)
     # strength words scale the step
-    soft = interpret("un peu plus de 808", p)[0].inst_low_db
-    hard = interpret("way more 808", p)[0].inst_low_db
-    assert 0 < soft < interpret("more 808", p)[0].inst_low_db < hard
+    soft = interpret("un peu plus de 808", p)[0].inst_bass_db
+    hard = interpret("way more 808", p)[0].inst_bass_db
+    assert 0 < soft < interpret("more 808", p)[0].inst_bass_db < hard
     # several requests at once, plus one it can't place
     new, said, unknown = interpret("voix plus forte, trop de reverb et trucmuche", p)
     assert len(said) == 2 and unknown == ["trucmuche"]

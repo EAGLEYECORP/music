@@ -44,6 +44,13 @@ MODELS = {
     "instrumental": MdxModel("UVR-MDX-NET-Inst_HQ_3", "instrumental", "vocals", 1.022,
                              about="the cleanest beat / karaoke version"),
     # this network outputs the reverb itself; the dry voice is what's left
+    # KUIELab MDX-Net (Music Demixing Challenge) single-instrument models; FFT sizes from the
+    # original configs, confirmed here: on a real beat the bass model at 16384 is the only setting
+    # whose output follows the beat's low end, the drums model at 4096 the most transient
+    "drums": MdxModel("kuielab_a_drums", "drums", "no_drums", 1.0, n_fft=4096, dim_f=2048, dim_t=512,
+                      about="the drums of a beat (kick, snare, hats)"),
+    "bass": MdxModel("kuielab_a_bass", "bass", "no_bass", 1.0, n_fft=16384, dim_f=2048, dim_t=512,
+                     about="the bass / 808 of a beat"),
     "dereverb": MdxModel("Reverb_HQ_By_FoxJoy", "reverb", "dry", 1.0,
                          about="removes room / added reverb from a vocal"),
 }
@@ -68,7 +75,7 @@ def fetch(model: MdxModel, say=print) -> Path:
     p = d / f"{model.file}.onnx"
     if p.exists() and p.stat().st_size > 1_000_000:
         return p
-    say(f"downloading the {model.file} model (~65 MB, once)")
+    say(f"downloading the {model.file} model (30-65 MB, once)")
     fd, tmp = tempfile.mkstemp(dir=d, suffix=".part")
     os.close(fd)
     try:
@@ -147,6 +154,16 @@ class _Mdx:
             if progress:
                 progress((k + 1) / len(starts))
         return out[:, :n] * m.compensate
+
+
+def split_beat(x: np.ndarray, sr: int, say=print) -> dict[str, np.ndarray]:
+    """A beat (no vocal) -> {"drums", "bass", "other"}; other = beat - drums - bass, so the three
+    always add back up to the beat exactly."""
+    drums = separate(x, sr, "drums", say=say)["drums"]
+    bass = separate(x, sr, "bass", say=say)["bass"]
+    from ..dsp import effects
+
+    return {"drums": drums, "bass": bass, "other": effects.to_stereo(x) - drums - bass}
 
 
 def separate(x: np.ndarray, sr: int, kind: str = "vocals", say=print, progress=None,

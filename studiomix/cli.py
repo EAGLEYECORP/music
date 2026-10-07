@@ -254,11 +254,13 @@ def separate_main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="studiomix separate",
         description="AI source separation (MDX-Net models, CPU, downloaded once).\n"
-                    + "\n".join(f"  {k:13s} {m.about}" for k, m in sep.MODELS.items()),
+                    + "\n".join(f"  {k:13s} {m.about}" for k, m in sep.MODELS.items())
+                    + "\n  beat          drums + bass + other of a beat",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("files", nargs="+", help="songs (or a vocal, for --what dereverb)")
-    ap.add_argument("--what", choices=list(sep.MODELS), default="vocals",
+    ap.add_argument("--what", choices=list(sep.MODELS) + ["beat"], default="vocals",
                     help="vocals: vocal + instrumental (default); instrumental: cleanest beat; "
+                         "beat: drums + bass + other of a beat; drums / bass: one of them; "
                          "dereverb: dry vocal + its reverb")
     ap.add_argument("-o", "--out", default="out")
     ap.add_argument("--best", action="store_true", help="twice as slow, ~0.05 dB cleaner (measured)")
@@ -273,7 +275,8 @@ def separate_main(argv: list[str]) -> int:
         for f_ in a.files:
             x, sr = audio_io.load(f_)
             print(f"{Path(f_).name}: separating ({a.what})...", flush=True)
-            for stem, y in sep.separate(x, sr, a.what, fast=not a.best).items():
+            parts = sep.split_beat(x, sr) if a.what == "beat" else sep.separate(x, sr, a.what, fast=not a.best)
+            for stem, y in parts.items():
                 p = out / f"{Path(f_).stem}_{stem}.wav"
                 audio_io.write_wav(p, y, sr, 24)
                 print(f"  {p}")

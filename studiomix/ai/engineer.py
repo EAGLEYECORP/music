@@ -49,7 +49,9 @@ RULES: list[Rule] = [
     Rule(r"(808|bass|basse|sub)\b.*\b(phone|telephone|portable|speaker|haut-parleur)|"
          r"(phone|telephone|portable).*\b(808|bass|basse)", "bass_harmonics", 0.5,
          "808 audible on phone speakers (bass harmonics)", unit=""),
-    Rule(r"\b(808|bass|basse|sub|kick|grosse caisse|low end|bas)\b", "inst_low_db", 2.5, "808 / kick weight"),
+    Rule(r"\b(808|bass|basse|sub|low end|bas)\b", "inst_bass_db", 2.5, "808 / bass level"),
+    Rule(r"\b(kick|drums?|batterie|snare|caisse claire|grosse caisse|hi-?hats?|charley|percs?|percussions?)\b",
+         "inst_drums_db", 2.0, "drums level"),
     Rule(r"\b(ad-?libs?|adlibs?)\b", "adlib_level_db", 2.0, "ad-lib level"),
     # whole-mix tone (before the vocal rules, so "the song sounds muffled" is about the mix)
     Rule(r"\b(mix|song|master|morceau|track|overall|global|son|instru\w*|beat|prod)\b.*\b(muffled|dull|etouffe\w*|terne|sourd\w*)\b|\b(muffled|dull|etouffe\w*|terne|sourd\w*)\b.*\b(mix|song|master|morceau|track|overall|global|son|instru\w*|beat|prod)\b",
@@ -63,6 +65,9 @@ RULES: list[Rule] = [
     Rule(r"\b(dull|muffled|etouffe\w*|sourd\w*|terne)\b", "vocal_air_db", 1.5, "vocal air / brightness",
          problem=True),
     Rule(r"\b(air|bright|brillant\w*|clair\w*)\b", "vocal_air_db", 1.5, "vocal air / brightness"),
+    Rule(r"\b(room|bedroom|bathroom|chambre|piece|salle de bain)\b.*\b(echo|reverb\w*|sound|son|resonne)\b|"
+         r"\b(echo|reverb\w*|resonne)\b.*\b(room|bedroom|chambre|piece)\b", "vocal_ai_dereverb", 1.0,
+         "AI: room echo removed from the vocal", absolute=True, unit=""),
     Rule(r"\b(dry|drier|sec|seche|plus sec)\b", "vocal_reverb", -0.06, "vocal reverb", unit=""),
     Rule(r"\b(reverb|reverbe|reverberation|space|espace|room|salle)\b", "vocal_reverb", 0.06,
          "vocal reverb", unit=""),
