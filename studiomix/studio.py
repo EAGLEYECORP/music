@@ -51,7 +51,10 @@ def _beat_key(x: np.ndarray, sr: int) -> dict:
     sung melody too). Unsure -> chromatic: snapping to the nearest semitone is always safe."""
     from .dsp import pitch
 
-    tonic, mode, conf = pitch.detect_key(pitch.chroma(x, sr))
+    prof = pitch.chroma(x, sr)
+    if not np.isfinite(prof).all() or np.std(prof) < 1e-9:  # silence / no pitched content
+        return {"key": "chromatic", "tonic": 0, "scale": "chromatic", "key_confidence": 0.0}
+    tonic, mode, conf = pitch.detect_key(prof)
     sure = conf >= 0.5
     return {"key": pitch.key_name(tonic, mode) if sure else "chromatic", "tonic": int(tonic),
             "scale": mode if sure else "chromatic", "key_confidence": round(float(conf), 2)}

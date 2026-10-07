@@ -31,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--offset-ms", type=float, default=0.0,
                     help="shift the vocal later (+) or earlier (-) relative to the beat, in milliseconds")
     ap.add_argument("--no-stems", action="store_true", help="don't export the processed vocal/instrumental stems")
+    ap.add_argument("--no-previews", action="store_true",
+                    help="skip the listen-like-a-fan previews (Spotify / Apple Music / YouTube / phone speaker)")
     ap.add_argument("-q", "--quiet", action="store_true")
     ap.add_argument("--version", action="version", version=f"studiomix {__version__}")
 
@@ -141,6 +143,12 @@ def _print_summary(log: dict, out: str) -> None:
         print(f"  [{'PASS' if c['ok'] else 'WARN'}] {c['check']}: {c['detail']}")
     for v in log["files"].values():
         print(f"  {v}")
+    fan = log.get("previews")
+    if fan:
+        print("  listen like a fan (how each app plays it):")
+        for e in fan["platforms"].values():
+            mix = f"   {fan['mix_label'].lower()}: {e['mix']['file']} ({e['mix']['plays_at_lufs']} LUFS)" if "mix" in e else ""
+            print(f"    {e['label']:13s} {e['master']['file']} ({e['master']['plays_at_lufs']} LUFS){mix}")
 
 
 def master_main(argv: list[str]) -> int:
@@ -166,6 +174,7 @@ def master_main(argv: list[str]) -> int:
     ap.add_argument("--deliver", metavar="VERSIONS",
                     help="extra verified versions: " + ", ".join(DELIVERY_PROFILES))
     ap.add_argument("--profile", metavar="NAME", help="master toward a learned reference profile")
+    ap.add_argument("--no-previews", action="store_true", help="skip the listen-like-a-fan previews")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
     from pathlib import Path
@@ -186,7 +195,8 @@ def master_main(argv: list[str]) -> int:
             preset = profiles.apply(prof, preset, keep_loudness=a.target_lufs is not None)
         log = master_mix(a.mix, a.out, preset, name=a.name, reference_path=a.reference,
                          vocal_lift_db=a.vocal_lift, ceiling_overridden=a.ceiling_dbtp is not None,
-                         deliver_extra=extra, verbose=not a.quiet, profile=prof)
+                         deliver_extra=extra, verbose=not a.quiet, profile=prof,
+                         previews=not a.no_previews)
     except (FileNotFoundError, ValueError, RuntimeError, KeyError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -298,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
             ceiling_overridden=args.ceiling_dbtp is not None, export_stems=not args.no_stems,
             verbose=not args.quiet, adlib_paths=args.adlibs, key=args.key,
             key_changes=args.key_changes, stack_at=stack_at, deliver_extra=extra, profile=prof,
+            previews=not args.no_previews,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(f"error: {e}", file=sys.stderr)

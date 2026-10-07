@@ -97,6 +97,12 @@ def main(argv: list[str]) -> int:
     report(bool(ff), "ffmpeg", "found - MP3/M4A input, MP3 previews and the second loudness meter" if ff else
            "missing - WAV still works, but install it for MP3/M4A and the independent meter: "
            + ("pkg install ffmpeg" if termux else "see ffmpeg.org"))
+    if ff:
+        from . import previews
+
+        report(None if not previews.available() else True, "listen-like-a-fan previews",
+               "ready (Ogg Vorbis, Opus, AAC encoders found)" if previews.available() else
+               "this ffmpeg lacks the Vorbis/Opus/AAC encoders - masters are unaffected, previews are skipped")
     if termux:
         dl = Path.home() / "storage" / "downloads"
         report(dl.is_dir(), "phone storage", f"{dl} -> Downloads" if dl.is_dir() else

@@ -125,6 +125,9 @@ def _run_job(job: dict) -> None:
                     "findings": log.get("diagnosis", {}).get("findings", []),
                     "checks": log["delivery_check"], "files": log["files"],
                     "seconds": log["processing_seconds"],
+                    "fan": log.get("previews"),
+                    "fan_files": [v["file"] for e in (log.get("previews") or {}).get("platforms", {}).values()
+                                  for k, v in e.items() if isinstance(v, dict) and "file" in v],
                 }
         except Exception as e:  # report every failure to the page
             traceback.print_exc()
@@ -149,6 +152,45 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_file(self, path: Path, ctype: str, extra: dict | None = None) -> None:
+        """Serve a file with HTTP range support: audio players need it to seek (and the
+        listen-like-a-fan A/B switch jumps to the same moment in another file)."""
+        size = path.stat().st_size
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", "").strip())
+        a, b = 0, size - 1
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                a = int(m.group(1))
+                b = min(size - 1, int(m.group(2))) if m.group(2) else size - 1
+            else:  # suffix range: the last N bytes
+                a = max(0, size - int(m.group(2)))
+            if a > b or a >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        partial = bool(m and (m.group(1) or m.group(2)))
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(b - a + 1))
+        if partial:
+            self.send_header("Content-Range", f"bytes {a}-{b}/{size}")
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        with open(path, "rb") as f:
+            f.seek(a)
+            left = b - a + 1
+            while left > 0:
+                chunk = f.read(min(left, 1 << 20))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
 
     def _json(self, code: int, obj) -> None:
         self._send(code, json.dumps(obj).encode(), "application/json")
@@ -207,22 +249,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {"error": "no such file"})
             ctype = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".flac": "audio/flac",
                      ".m4a": "audio/mp4", ".aac": "audio/aac"}.get(path.suffix, "application/octet-stream")
-            return self._send(200, path.read_bytes(), ctype)
+            return self._send_file(path, ctype)
         m = re.fullmatch(r"/jobs/([0-9a-f]{12})/([^/]+)", self.path)
         if m:
             with _jobs_lock:
                 job = _jobs.get(m.group(1))
-                allowed = set((job or {}).get("result", {}).get("files", {}).values()) if job else set()
+                res = (job or {}).get("result", {})
+                allowed = set(res.get("files", {}).values()) | set(res.get("fan_files", []))
             from urllib.parse import unquote
 
             fname = unquote(m.group(2))
             if not job or fname not in allowed:
                 return self._json(404, {"error": "no such file"})
             path = Path(job["out"]) / fname
-            ctype = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".json": "application/json",
-                     ".txt": "text/plain; charset=utf-8"}.get(path.suffix, "application/octet-stream")
-            return self._send(200, path.read_bytes(), ctype,
-                              {"Content-Disposition": f'inline; filename="{fname}"'})
+            ctype = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
+                     ".json": "application/json", ".txt": "text/plain; charset=utf-8"}.get(path.suffix,
+                                                                                             "application/octet-stream")
+            return self._send_file(path, ctype, {"Content-Disposition": f'inline; filename="{fname}"'})
         return self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -625,6 +668,8 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
 .takes .star.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
 .edit { width: 100%; display: grid; gap: 6px; padding: 8px 0 2px; }
 .edit[hidden] { display: none; }
+#fan[hidden], audio[hidden] { display: none; }
+.seg input:disabled + label { opacity: .35; pointer-events: none; }
 .edit label { display: grid; grid-template-columns: 92px 1fr 64px; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
 .edit output { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
 #diag { margin: 0 0 12px; padding-left: 18px; font-size: 14px; }
@@ -802,6 +847,22 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
   <h2>Done</h2>
   <ul id="diag"></ul>
   <div class="big"><div><b id="rl"></b><span>LUFS</span></div><div><b id="rt"></b><span>dBTP peak</span></div><div><b id="rk"></b><span>key</span></div></div>
+  <div id="fan" hidden>
+    <h2 style="margin-top:14px">Listen like a fan</h2>
+    <p class="muted" style="margin:0 2px 10px">Exactly how each app plays it: its loudness rule and its sound format. Switch while it plays - it stays at the same moment.</p>
+    <div class="seg" style="grid-template-columns:repeat(4,1fr)">
+      <input type="radio" name="fanplat" id="fp1" value="spotify" checked><label for="fp1">Spotify</label>
+      <input type="radio" name="fanplat" id="fp2" value="apple"><label for="fp2">Apple</label>
+      <input type="radio" name="fanplat" id="fp3" value="youtube"><label for="fp3">YouTube</label>
+      <input type="radio" name="fanplat" id="fp4" value="phone"><label for="fp4">Phone</label>
+    </div>
+    <div class="seg" style="grid-template-columns:1fr 1fr;margin-top:8px">
+      <input type="radio" name="fanab" id="fa1" value="master" checked><label for="fa1">Master</label>
+      <input type="radio" name="fanab" id="fa2" value="mix"><label for="fa2" id="fanmixlbl">Before mastering</label>
+    </div>
+    <audio id="fanplayer" controls preload="auto" style="margin-top:10px"></audio>
+    <p class="muted" id="fannote" style="margin:6px 2px 0"></p>
+  </div>
   <audio id="player" controls preload="metadata"></audio>
   <ul class="checks" id="checks"></ul>
   <div class="dl" id="files"></div>
@@ -1245,6 +1306,42 @@ async function poll(id) {
   show(id, j);
 }
 
+let fanData = null, fanUrl = null;
+function fanShow(fan, url) {
+  fanData = fan; fanUrl = url;
+  $("#fan").hidden = !fan; $("#player").hidden = !!fan;
+  if (!fan) return;
+  $("#fanmixlbl").textContent = fan.mix_label || "Before mastering";
+  // Apple and the phone preview use AAC, like those apps; a few browsers (e.g. Chromium on Linux)
+  // can't play it - say so instead of a silent button
+  const aac = $("#fanplayer").canPlayType('audio/mp4; codecs="mp4a.40.2"') !== "";
+  ["fp2", "fp4"].forEach(id => { $("#" + id).disabled = !aac; });
+  if (!aac && ["apple", "phone"].includes(document.querySelector("input[name=fanplat]:checked").value)) $("#fp1").checked = true;
+  fanData.aacNote = aac ? "" : " (Apple and Phone previews are AAC files that this browser can't play - Chrome on Android and Safari can.)";
+  fanPick(false);
+}
+function fanPick(keepTime) {
+  if (!fanData) return;
+  const plat = document.querySelector("input[name=fanplat]:checked").value;
+  const e = fanData.platforms[plat], hasMix = !!e.mix;
+  $("#fa2").disabled = !hasMix;
+  if (!hasMix) $("#fa1").checked = true;
+  const which = document.querySelector("input[name=fanab]:checked").value, v = e[which];
+  const p = $("#fanplayer"), t = p.currentTime, wasPlaying = !p.paused;
+  p.src = fanUrl(v.file);
+  if (keepTime) p.addEventListener("loadedmetadata", () => { p.currentTime = t; if (wasPlaying) p.play().catch(() => {}); }, {once: true});
+  const say = (x, who) => `${who} plays at ${x.plays_at_lufs} LUFS` + (x.gain_db < 0 ? ` (turned down ${-x.gain_db} dB)` :
+    x.gain_db > 0 ? ` (turned up ${x.gain_db} dB)` : "");
+  let note = `On ${e.label}: ` + say(e.master, "the master");
+  if (hasMix) {
+    const d = (e.master.plays_at_lufs - e.mix.plays_at_lufs).toFixed(1);
+    note += `; ${(fanData.mix_label || "before mastering").toLowerCase()}: ${e.mix.plays_at_lufs} LUFS` +
+      (d > 0.4 ? ` - ${d} dB quieter, it can't be turned up further without clipping.` : ".");
+  } else note += ".";
+  if (plat === "phone") note += " Phone speakers play no deep bass - check the 808 still reads.";
+  $("#fannote").textContent = note + (fanData.aacNote || "");
+}
+document.querySelectorAll("input[name=fanplat],input[name=fanab]").forEach(r => r.addEventListener("change", () => fanPick(true)));
 function show(id, j) {
   const r = j.result, o = r.output;
   const dg = $("#diag"); dg.innerHTML = "";
@@ -1252,6 +1349,7 @@ function show(id, j) {
   $("#rl").textContent = o.integrated_lufs; $("#rt").textContent = o.true_peak_dbtp; $("#rk").textContent = r.key;
   const url = f => "/jobs/" + id + "/" + encodeURIComponent(f);
   $("#player").src = url(r.files.mp3_preview || r.files.master_16bit_cd);
+  fanShow(r.fan, url);
   $("#checks").innerHTML = "";
   r.checks.forEach(c => { const li = document.createElement("li");
     li.innerHTML = '<span class="' + (c.ok ? "ok" : "warn") + '">' + (c.ok ? "✓" : "!") + "</span> ";

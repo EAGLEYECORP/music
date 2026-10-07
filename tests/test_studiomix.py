@@ -819,3 +819,69 @@ def test_doctor_checks_device_and_makes_a_test_song(capsys):
     assert main(["doctor", "--quick"]) == 0
     out = capsys.readouterr().out
     assert "[PASS] test song" in out and "3-minute song takes about" in out and "[FAIL]" not in out
+
+
+def test_playback_gain_follows_each_platforms_rule():
+    from studiomix.previews import playback_gain_db
+
+    assert playback_gain_db(-8.5, -2.0, -14.0, True) == -5.5           # loud master: turned down
+    assert playback_gain_db(-20.0, -6.0, -14.0, True) == 5.0           # quiet mix: up, but only to -1 dBTP
+    assert playback_gain_db(-20.0, -3.0, -14.0, True) == 2.0
+    assert playback_gain_db(-20.0, -6.0, -14.0, False) == 0.0          # YouTube never turns up
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_listen_like_a_fan_previews(demo_files, tmp_path):
+    from studiomix import previews
+    from studiomix.engine import master_mix
+
+    if not previews.available():
+        pytest.skip("ffmpeg without vorbis/opus/aac encoders")
+    mix = tmp_path / "mix.wav"
+    x, sr = audio_io.load(demo_files / "b.wav")
+    audio_io.write_wav(mix, x * 0.25, sr)
+    log = master_mix(mix, tmp_path / "out", get_preset("trap"), name="m", verbose=False)
+    fan = log["previews"]
+    assert set(fan["platforms"]) == {"spotify", "apple", "youtube", "phone"}
+    sp = fan["platforms"]["spotify"]
+    assert sp["master"]["plays_at_lufs"] == -14.0 and "mix" in sp
+    assert sp["mix"]["plays_at_lufs"] < sp["master"]["plays_at_lufs"]   # unmastered: can't be turned up enough
+    assert "mix" not in fan["platforms"]["apple"]
+    for e in fan["platforms"].values():
+        for k in ("master", "mix"):
+            if k in e:
+                dec, dsr = audio_io.load(tmp_path / "out" / e[k]["file"])
+                assert dec.shape[-1] > dsr * 5
+    # the Spotify preview really plays at -14 LUFS after the codec
+    dec, dsr = audio_io.load(tmp_path / "out" / sp["master"]["file"])
+    assert abs(analysis.integrated_lufs(dec, dsr) + 14.0) < 0.3
+    assert any(c["check"].startswith("Survives Spotify") for c in log["delivery_check"])
+    assert "LISTEN LIKE A FAN" in (tmp_path / "out" / "m_report.txt").read_text()
+
+
+def test_web_serves_byte_ranges(tmp_path):
+    """Audio players seek with Range requests - the A/B switch depends on it."""
+    import http.client
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    from studiomix import studio, web
+
+    web.Handler.jobs_dir = tmp_path
+    p = tmp_path / "t.wav"
+    audio_io.write_wav(p, np.zeros((1, 48000)), 48000, 32)
+    studio.save_beat(tmp_path, "r", "beat.wav", p.read_bytes())
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1])
+        c.request("GET", "/studio/r/beat", headers={"Range": "bytes=100-199"})
+        r = c.getresponse(); body = r.read()
+        assert r.status == 206 and len(body) == 100 and r.getheader("Content-Range").endswith("/" + str(p.stat().st_size))
+        assert body == p.read_bytes()[100:200]
+        c.request("GET", "/studio/r/beat", headers={"Range": "bytes=-10"})
+        r = c.getresponse(); assert r.status == 206 and r.read() == p.read_bytes()[-10:]
+        c.request("GET", "/studio/r/beat")
+        r = c.getresponse(); assert r.status == 200 and r.getheader("Accept-Ranges") == "bytes" and len(r.read()) == p.stat().st_size
+    finally:
+        srv.shutdown()

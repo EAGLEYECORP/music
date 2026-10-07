@@ -18,7 +18,45 @@ out/
   My Song_adlib_stem_24bit.wav        <- processed ad-libs on their own
   My Song_instrumental_stem_24bit.wav <- processed beat on its own
   My Song_report.txt / .json          <- loudness, peaks, what was done, delivery checks
+  My Song_fan_spotify_master.ogg ...  <- "listen like a fan" previews (see below)
 ```
+
+## Listen like a fan
+
+Every app plays your song differently. Spotify, Apple Music and YouTube each turn every song to
+their own loudness, then re-encode it in their own format. A phone speaker plays no deep bass at
+all. So after the master is made, studiomix renders it **exactly the way each one plays it**.
+It uses each platform's published loudness rule and its codec, and plays your mix from *before
+mastering* by the same rules, so you can A/B them:
+
+| | loudness rule | format |
+|---|---|---|
+| Spotify | -14 LUFS; quiet songs only turned up as far as -1 dBTP allows | Ogg Vorbis ~160k |
+| Apple Music | -16 LUFS (Sound Check), same headroom rule | AAC 256k |
+| YouTube | -14 LUFS, only ever turned down | Opus 128k |
+| Phone speaker | -14 LUFS turned down only, mono, a small speaker's response | AAC 128k |
+
+In the app you get a player with **Spotify / Apple / YouTube / Phone** and **Master / Before
+mastering** (or **Your mix** when you mastered a finished mix). Switch while it plays and it
+stays at the same moment, so the comparison is fair: you hear the difference the master makes,
+not just "louder". A line under it says what is going on, for example *"On Spotify: the master
+plays at -14 LUFS (turned down 5.5 dB); your mix: -17.2 LUFS, 3.2 dB quieter, it can't be
+turned up further without clipping."*
+
+It also checks what fans with **normalisation switched off** get. The master is encoded at full
+level with Spotify's codec, decoded again, and checked for clipping, because lossy encoders push
+peaks up. The pass/fail is judged on Spotify's 320k stream, the one listeners who switch
+normalisation off usually have. On -2 dBTP trap masters it decodes around -1.7 dBFS, which is
+safe. The 160k stream overshoots more and varies with the song (measured from -0.2 to +0.7 dBFS).
+That is reported too, with the context: players decode in floating point and scale by the volume,
+so it only clips at full volume on fixed-point outputs. This is why loud masters need the
+headroom, and here it is measured instead of assumed. (ffmpeg's own
+AAC encoder is deliberately not used for this check: its overshoot doesn't even follow the
+master's ceiling, so it would grade the encoder, not your master.)
+
+It needs ffmpeg with the Vorbis, Opus and AAC encoders (the Termux package has them; `studiomix
+doctor` tells you). It adds about 30 s per 3-minute song on a computer and more on a phone, and
+`studiomix doctor`'s time estimate includes it. `--no-previews` skips it.
 
 ## Already have a mix? Master it
 

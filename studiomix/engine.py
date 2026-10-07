@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from . import audio_io, chains
+from . import previews as previews_mod
 from .dsp import analysis, effects, pitch
 from .presets import DELIVERY_PROFILES, Preset, adlib_preset
 
@@ -53,6 +54,7 @@ def run(
     progress=None,
     deliver_extra: list[str] | None = None,
     profile: dict | None = None,
+    previews: bool = True,
 ) -> dict:
     t0 = time.time()
 
@@ -214,7 +216,7 @@ def run(
         premaster = _park(mix, spill / "premaster.npy")
         del mix
         return deliver(pre, premaster, sr, preset, name, out_dir, log, say, t0, ceiling_overridden, stems,
-                       deliver_extra)
+                       deliver_extra, fan_mix=premaster if previews else None, fan_mix_label="Before mastering")
     finally:
         stems = premaster = None
         shutil.rmtree(spill, ignore_errors=True)
@@ -239,6 +241,7 @@ def master_mix(
     verbose: bool = True,
     progress=None,
     profile: dict | None = None,
+    previews: bool = True,
 ) -> dict:
     """Finished or rough stereo mix -> diagnosed, repaired, mastered and verified release files."""
     t0 = time.time()
@@ -257,6 +260,7 @@ def master_mix(
     x, sr0 = audio_io.load(mix_path)
     sr = audio_io.working_rate(sr0)
     x = effects.to_stereo(audio_io.resample(x, sr0, sr))
+    uploaded = x if previews else None  # "your mix" for the listen-like-a-fan comparison
     log["sample_rate"] = sr
     log["input"] = {"mix": {"file": str(mix_path), "sr": sr0, "channels": x.shape[0], **analysis.measure(x, sr)}}
     reference = None
@@ -276,12 +280,14 @@ def master_mix(
 
     say("master: tonal balance, multiband + glue compression, stereo image")
     pre = chains.master_chain(x, sr, preset, log["master"], reference, profile)
-    return deliver(pre, x, sr, preset, name, out_dir, log, say, t0, ceiling_overridden, None, deliver_extra)
+    return deliver(pre, x, sr, preset, name, out_dir, log, say, t0, ceiling_overridden, None, deliver_extra,
+                   fan_mix=uploaded, fan_mix_label="Your mix")
 
 
 def deliver(pre: np.ndarray, premaster: np.ndarray, sr: int, preset: Preset, name: str, out_dir: Path, log: dict,
             say, t0: float, ceiling_overridden: bool = False, stems: list | None = None,
-            extra: list[str] | None = None) -> dict:
+            extra: list[str] | None = None, fan_mix: np.ndarray | None = None,
+            fan_mix_label: str = "Before mastering") -> dict:
     """Loudness + limiting, every export, extra delivery versions, and verification of the files
     as written. Shared by the vocal+beat pipeline and the finished-mix mastering pipeline."""
     if preset.punch > 0 and preset.target_lufs > -11.0:
@@ -351,9 +357,22 @@ def deliver(pre: np.ndarray, premaster: np.ndarray, sr: int, preset: Preset, nam
         files[f"version_{prof}"] = pth.name
         versions[prof] = (label, lufs, tp_max, tol)
 
+    final = analysis.measure(master, sr)
+
+    # ---------------------------------------------------------------- listen like a fan
+    fan = None
+    if fan_mix is not None and previews_mod.available():
+        say("listen like a fan: the master and your mix the way Spotify, Apple Music, YouTube and a phone play them")
+        try:
+            fan = previews_mod.make(out_dir, name, master, np.asarray(fan_mix)[:, :final_len], sr,
+                                    master_lufs_tp=(final["integrated_lufs"], final["true_peak_dbtp"]))
+            fan["mix_label"] = fan_mix_label
+            log["previews"] = fan
+        except Exception as e:  # previews are a bonus: never lose a finished master over them
+            log["previews_error"] = str(e)
+
     # ---------------------------------------------------------------- report
     say("verifying the delivered files (our meter + ffmpeg EBU R128)")
-    final = analysis.measure(master, sr)
     deliverables = {}
     for key_ in ["master_24bit", "master_16bit_cd", "mp3_preview"] + [f"version_{p_}" for p_ in versions]:
         if key_ in files:
@@ -376,6 +395,19 @@ def deliver(pre: np.ndarray, premaster: np.ndarray, sr: int, preset: Preset, nam
         checks.insert(3, {"check": f"{label} version", "ok": ok,
                           "detail": f"{o_['integrated_lufs']:.2f} LUFS (spec {lufs} +-{tol}), {o_['true_peak_dbtp']:.2f} dBTP "
                                     f"(max {tp_max}), LRA {o_['loudness_range_lu']} LU"})
+    if fan and fan["codec_checks"]:
+        # judged on Spotify's 320k stream (premium listeners are the ones who switch normalisation
+        # off); the 160k stream overshoots more and depends on the material - reported, with context
+        hi, lo = fan["codec_checks"][0], fan["codec_checks"][-1]
+        ok = hi["decoded_peak_dbfs"] <= 0.0
+        detail = ", ".join(f"{c['codec']}: decoded peak {c['decoded_peak_dbfs']:+.2f} dBFS" for c in fan["codec_checks"])
+        if not ok:
+            detail += " - clips after encoding: lower the ceiling (--ceiling -2.5) or the loudness"
+        elif lo["decoded_peak_dbfs"] > 0.0:
+            detail += (" - the 160k stream overshoots; players decode in floating point and scale by the volume,"
+                       " so it only clips at full volume on fixed-point outputs")
+        checks.append({"check": "Survives Spotify's encoder at full level (normalisation off)", "ok": ok,
+                       "detail": detail})
     log["delivery_check"] = checks
     log["processing_seconds"] = round(time.time() - t0, 1)
 
@@ -421,7 +453,7 @@ def delivery_check(m: dict, ceiling: float, target: float | None = None,
          "detail": f"{m['stereo_correlation']}"},
         {"check": "Dynamics (PLR >= 7 dB; loud trap masters often sit at 6-7)", "ok": m["plr_db"] >= 7.0,
          "detail": f"PLR {m['plr_db']} dB" + ("" if m["plr_db"] >= 7.0 else
-                                                " - for more punch, trade a little loudness: --punch")},
+                                                " - for more punch, trade a little loudness: Punch option (--punch)")},
     ]
     turn_down = max(0.0, lufs + 14.0)
     checks.append({
@@ -470,6 +502,15 @@ def format_report(name: str, log: dict) -> str:
             lines.append(f"  {section:12s} {k:24s} {v}")
     if log.get("key", {}).get("note"):
         lines.append(f"  NOTE: {log['key']['note']}")
+    fan = log.get("previews")
+    if fan:
+        lines += ["", "LISTEN LIKE A FAN (each app's loudness rule + its codec)"]
+        for e in fan["platforms"].values():
+            mix = (f"   | {fan['mix_label'].lower()}: {e['mix']['plays_at_lufs']} LUFS ({e['mix']['gain_db']:+.1f} dB)"
+                   if "mix" in e else "")
+            lines.append(f"  {e['label']:13s} master {e['master']['plays_at_lufs']} LUFS ({e['master']['gain_db']:+.1f} dB){mix}")
+        for c in fan["codec_checks"]:
+            lines.append(f"  normalisation off, {c['codec']}: decoded peak {c['decoded_peak_dbfs']:+.2f} dBFS")
     if log.get("deliverables"):
         lines += ["", "DELIVERED FILES (decoded from disk)        ours: LUFS / dBTP / LRA      ffmpeg: LUFS / dBTP"]
         for d in log["deliverables"].values():
