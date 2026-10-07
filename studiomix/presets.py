@@ -49,6 +49,8 @@ class Preset:
     # ---- instrumental
     inst_hpf_hz: float = 25.0
     inst_carve_db: float = 3.0          # max dip in the 1.5-5 kHz band while the vocal sings
+    inst_low_db: float = 0.0            # low shelf on the beat at 90 Hz (808 / kick weight)
+    bass_harmonics: float = 0.0         # 0-1: overtones of the sub so the 808 reads on phone speakers
 
     # ---- master
     master_tonal_strength: float = 0.4
@@ -181,4 +183,6 @@ SAFE_RANGES = {
     "tune_flex_cents": (0.0, 100.0, "flex (cents)"),
     "master_width": (0.0, 2.0, "width"),
     "punch": (0.0, 1.0, "punch"),
+    "inst_low_db": (-8.0, 8.0, "beat low end (dB)"),
+    "bass_harmonics": (0.0, 1.0, "bass harmonics"),
 }

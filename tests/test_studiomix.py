@@ -929,3 +929,72 @@ def test_ai_remix_of_a_finished_song(tmp_path):
     assert {"ai_vocals", "ai_instrumental", "master_24bit"} <= set(log["files"])
     assert log["ai_remix"]["model"] == "Kim_Vocal_2" and abs(log["output"]["integrated_lufs"] + 8.5) < 0.1
     assert "AI remix" in (tmp_path / "out" / "s_report.txt").read_text()
+
+
+def test_engineer_understands_plain_words_in_english_and_french():
+    from studiomix.ai.engineer import interpret
+
+    p = get_preset("trap")
+    cases = {  # phrase -> (field, expected sign of the change, or the exact value)
+        "more 808": ("inst_low_db", +1), "le 808 est trop fort": ("inst_low_db", -1),
+        "vocal louder": ("vocal_balance_db", +1), "la voix est trop forte": ("vocal_balance_db", -1),
+        "pas assez de voix": ("vocal_balance_db", +1),
+        "less harsh": ("vocal_deess_db", +1), "too harsh": ("vocal_deess_db", +1),
+        "voix trop agressive": ("vocal_deess_db", +1),
+        "more reverb": ("vocal_reverb", +1), "trop de reverb": ("vocal_reverb", -1), "dry": ("vocal_reverb", -1),
+        "ad-libs quieter": ("adlib_level_db", -1), "wider": ("master_width", +1),
+        "the song sounds muffled": ("master_tilt_db_oct", +1), "darker": ("master_tilt_db_oct", -1),
+        "808 on phones": ("bass_harmonics", +1), "louder": ("target_lufs", +1),
+        "hard autotune": ("tune_retune_ms", 0.0), "no autotune": ("tune_amount", 0.0), "punchier": ("punch", 1.0),
+    }
+    for phrase, (field, want) in cases.items():
+        new, said, unknown = interpret(phrase, p)
+        assert said and not unknown, phrase
+        d = getattr(new, field) - getattr(p, field)
+        if isinstance(want, float):
+            assert getattr(new, field) == want, phrase
+        else:
+            assert d * want > 0, (phrase, d)
+    # strength words scale the step
+    soft = interpret("un peu plus de 808", p)[0].inst_low_db
+    hard = interpret("way more 808", p)[0].inst_low_db
+    assert 0 < soft < interpret("more 808", p)[0].inst_low_db < hard
+    # several requests at once, plus one it can't place
+    new, said, unknown = interpret("voix plus forte, trop de reverb et trucmuche", p)
+    assert len(said) == 2 and unknown == ["trucmuche"]
+    # never out of the safe ranges
+    assert interpret("way louder, way louder, way louder", p)[0].target_lufs <= -7.5
+
+
+def test_bass_harmonics_make_the_808_reach_a_phone_speaker():
+    from studiomix import previews
+
+    sr = 48000
+    t = np.arange(sr * 4) / sr
+    env = np.exp(-(t % 0.5) * 6)
+    beat = np.vstack([0.5 * np.sin(2 * np.pi * 50 * t) * env] * 2)  # a bare 808 at 50 Hz
+    beat = beat + 0.02 * np.random.default_rng(1).standard_normal(beat.shape)  # + a quiet hi-hat bed
+    sub = filters.lowpass(beat, sr, 120.0, order=4)
+    e = lambda x: float(np.sum(previews.phone_speaker(x, sr) ** 2))  # noqa: E731
+    before = 10 * np.log10(e(sub) / e(beat))
+    h = np.vstack([chains.bass_harmonics(beat, sr, 0.5)] * 2)
+    after = 10 * np.log10(e(sub + h) / e(beat + h))
+    assert before < -25 and after > before + 15
+    spec = np.abs(np.fft.rfft(h[0]))
+    f = np.fft.rfftfreq(len(h[0]), 1 / sr)
+    assert spec[f < 100].sum() < 0.05 * spec.sum()  # only overtones are added, not more sub
+
+
+def test_engineer_notes_find_a_sinking_vocal(tmp_path, demo_files):
+    from studiomix.ai import notes
+    from studiomix.engine import run
+
+    log = run(demo_files / "v.wav", demo_files / "b.wav", tmp_path, get_preset("trap"), name="n", verbose=False,
+              previews=False)
+    assert all({"text", "ask"} <= set(n) for n in log.get("notes", []))
+    v, sr = audio_io.load(tmp_path / log["files"]["vocal_stem"])
+    v[:, 3 * sr: 8 * sr] *= 10 ** (-7 / 20)  # the vocal drops 7 dB for five seconds
+    audio_io.write_wav(tmp_path / log["files"]["vocal_stem"], v, sr, 24)
+    found = notes.make(tmp_path, log["files"], get_preset("trap"), log["output"])
+    sink = [n for n in found if n["ask"] == "vocal louder"]
+    assert sink and "0:0" in sink[0]["text"]

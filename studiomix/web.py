@@ -133,6 +133,8 @@ def _run_job(job: dict) -> None:
                     "checks": log["delivery_check"], "files": log["files"],
                     "seconds": log["processing_seconds"],
                     "fan": log.get("previews"),
+                    "notes": log.get("notes", []),
+                    "engineer": job.get("engineer", []),
                     "fan_files": [v["file"] for e in (log.get("previews") or {}).get("platforms", {}).values()
                                   for k, v in e.items() if isinstance(v, dict) and "file" in v],
                 }
@@ -198,6 +200,35 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 left -= len(chunk)
+
+    def _redo(self, job_id: str, ask: str) -> None:
+        """Same song, same inputs, plus plain-words changes on top of the previous settings."""
+        from .ai.engineer import interpret
+
+        with _jobs_lock:
+            old = _jobs.get(job_id)
+        if not old or old.get("status") != "done":
+            return self._json(404, {"error": "that song isn't finished (or the app was restarted)"})
+        if not ask.strip():
+            return self._json(400, {"error": "say what to change, e.g. \"more 808, vocal louder\""})
+        preset, said, unknown = interpret(ask, old["preset"])
+        if not said:
+            return self._json(400, {"error": "didn't understand that - try e.g. \"more 808\", \"vocal louder\", "
+                                             "\"less harsh\", \"more reverb\", \"voix plus forte\""})
+        job = dict(old)
+        job.update(id=uuid.uuid4().hex[:12], status="queued", log=[], preset=preset, started=time.time(),
+                   result=None, options=dict(old["options"]),
+                   engineer=old.get("engineer", []) + [{"ask": ask, "changes": said, "not_understood": unknown}])
+        version = old.get("version", 1) + 1
+        job["version"] = version
+        job["out"] = Path(re.sub(r"_v\d+$", "", str(old["out"])) + f"_v{version}")
+        job["name"] = re.sub(r"_v\d+$", "", old["name"]) + f"_v{version}"
+        if any("master loudness" in c for c in said):
+            job["options"]["lufs_set"] = True
+        with _jobs_lock:
+            _jobs[job["id"]] = job
+        threading.Thread(target=_run_job, args=(job,), daemon=True).start()
+        return self._json(200, {"id": job["id"], "changes": said, "not_understood": unknown})
 
     def _json(self, code: int, obj) -> None:
         self._send(code, json.dumps(obj).encode(), "application/json")
@@ -280,7 +311,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "forbidden: requests must come from the studiomix page"})
         st = re.fullmatch(r"/api/studio/([A-Za-z0-9_-]{1,40})/(beat|take|delete/([0-9a-f]{10})|update/([0-9a-f]{10}))",
                           self.path)
-        if self.path not in ("/api/jobs", "/api/learn") and not st:
+        redo = re.fullmatch(r"/api/jobs/([0-9a-f]{12})/redo", self.path)
+        if self.path not in ("/api/jobs", "/api/learn") and not st and not redo:
             return self._json(404, {"error": "not found"})
         if st and st.group(3):
             from . import studio
@@ -298,6 +330,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "expected a form upload"})
         fields, files = _parse_multipart(ctype, self.rfile.read(length))
         f = lambda k, d="": (fields.get(k) or [d])[0].strip()  # noqa: E731
+        if redo:
+            return self._redo(redo.group(1), f("ask"))
         if st:
             from . import studio
 
@@ -391,6 +425,12 @@ class Handler(BaseHTTPRequestHandler):
             preset = get_preset(preset_name, **overrides)
         except ValueError as e:
             return self._json(400, {"error": str(e)})
+        engineer = []
+        if f("ask"):
+            from .ai.engineer import interpret
+
+            preset, said, unknown = interpret(f("ask"), preset)
+            engineer.append({"ask": f("ask"), "changes": said, "not_understood": unknown})
 
         job_id = uuid.uuid4().hex[:12]
         first = f("session") if mode == "studio" else files["mix" if mode == "mix" else "lead"][0][0]
@@ -411,8 +451,10 @@ class Handler(BaseHTTPRequestHandler):
                         "vocal_lift": 2.0 if f("vocal_lift") == "on" else 0.0,
                         "ai_remix": f("ai_remix") == "on",
                         "profile": f("profile"), "lufs_set": bool(f("lufs"))},
-            "started": time.time(),
+            "started": time.time(), "engineer": engineer,
         }
+        if engineer and any("master loudness" in c for c in engineer[0]["changes"]):
+            job["options"]["lufs_set"] = True  # a profile must not undo "louder"
         if mode == "studio":
             job["root"], job["session"] = self.jobs_dir, f("session")
         elif mode == "mix":
@@ -647,6 +689,10 @@ details[open] summary { margin-bottom: 10px; }
 .big span { color: var(--muted); font-size: 12px; }
 audio { width: 100%; margin: 4px 0 12px; }
 .checks { list-style: none; padding: 0; margin: 0 0 12px; font-size: 14px; }
+.notes { list-style: none; padding: 0; margin: 8px 0; }
+.notes li { padding: 10px 12px; margin: 6px 0; border-radius: 12px; background: var(--chip); font-size: 14px; }
+.notes li.done { background: none; padding: 2px 0; color: var(--muted); font-size: 13px; }
+.notes li button { margin-top: 8px; display: block; }
 .checks li { padding: 4px 0; } .checks .ok { color: var(--ok); } .checks .warn { color: var(--warn); }
 .dl a { display: flex; justify-content: space-between; padding: 12px; border: 1px solid var(--line); border-radius: 12px;
   margin-bottom: 8px; color: var(--text); text-decoration: none; }
@@ -781,6 +827,9 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
 <section>
   <h2>Sound</h2>
   <div class="row"><div class="stack"><div class="lbl">Style</div><select name="preset">{{PRESETS}}</select></div></div>
+  <div class="row"><div class="stack"><div class="lbl">Tell the engineer <span class="muted">(optional · English or French)</span></div>
+    <input type="text" name="ask" placeholder="e.g. more 808, vocal a bit less harsh" autocomplete="off">
+    <div class="hint">Plain words: 808, vocal louder, less harsh, more reverb, dry, hard autotune, ad-libs quieter, wider, punchier, louder, darker… · voix plus forte, trop de reverb</div></div></div>
   <div class="row"><div class="stack"><div class="lbl">Sound like <span class="muted">(your reference library)</span></div>
     <select name="profile" id="profsel"><option value="">— no reference profile —</option>{{PROFILES}}</select>
     <div class="hint">Matches loudness, tonal balance and stereo width of the songs you taught it</div></div></div>
@@ -882,6 +931,15 @@ body[data-mode=studio] .m-mix, body[data-mode=studio] .m-stems { display: none; 
     <p class="muted" id="fannote" style="margin:6px 2px 0"></p>
   </div>
   <audio id="player" controls preload="metadata"></audio>
+  <div id="eng">
+    <h2 style="margin-top:14px">Engineer</h2>
+    <ul class="notes" id="engdone"></ul>
+    <ul class="notes" id="notes"></ul>
+    <div class="row"><div class="stack"><div class="lbl">Not quite? Say what to change</div>
+      <input type="text" id="redoask" placeholder="e.g. more 808, voix plus forte" autocomplete="off"></div></div>
+    <button type="button" class="small" id="redobtn">Redo with these changes</button>
+    <p class="muted" id="redomsg" style="margin:6px 2px 0"></p>
+  </div>
   <ul class="checks" id="checks"></ul>
   <div class="dl" id="files"></div>
   <p class="muted" id="where"></p>
@@ -1365,6 +1423,36 @@ function fanPick(keepTime) {
   $("#fannote").textContent = note + (fanData.aacNote || "");
 }
 document.querySelectorAll("input[name=fanplat],input[name=fanab]").forEach(r => r.addEventListener("change", () => fanPick(true)));
+let lastJob = null;
+function engShow(id, r) {
+  lastJob = id;
+  const done = $("#engdone"); done.innerHTML = "";
+  (r.engineer || []).forEach(e => {
+    e.changes.forEach(c => { const li = document.createElement("li"); li.className = "done"; li.textContent = "✓ " + c; done.appendChild(li); });
+    (e.not_understood || []).forEach(u => { const li = document.createElement("li"); li.className = "done";
+      li.textContent = "? didn't understand \u201c" + u + "\u201d"; done.appendChild(li); });
+  });
+  const ul = $("#notes"); ul.innerHTML = "";
+  (r.notes || []).forEach(n => {
+    const li = document.createElement("li"), b = document.createElement("button");
+    li.textContent = n.text; b.type = "button"; b.className = "mini"; b.textContent = "Fix: \u201c" + n.ask + "\u201d";
+    b.addEventListener("click", () => { const box = $("#redoask");
+      if (!box.value.includes(n.ask)) box.value = (box.value ? box.value + ", " : "") + n.ask; b.disabled = true; });
+    li.appendChild(b); ul.appendChild(li);
+  });
+  if (!(r.notes || []).length) { const li = document.createElement("li"); li.className = "done"; li.textContent = "No problems found that need fixing."; ul.appendChild(li); }
+  $("#redoask").value = ""; $("#redomsg").textContent = "";
+}
+$("#redobtn").addEventListener("click", async () => {
+  const ask = $("#redoask").value.trim(); if (!ask || !lastJob) { $("#redomsg").textContent = "Type what to change first."; return; }
+  const fd = new FormData(); fd.append("ask", ask);
+  const res = await fetch("/api/jobs/" + lastJob + "/redo", {method: "POST", body: fd}); const r = await res.json();
+  if (!res.ok) { $("#redomsg").textContent = r.error; return; }
+  $("#result").style.display = "none"; $("#progress").style.display = "block";
+  $("#steps").innerHTML = ""; $("#ptitle").textContent = "Redoing: " + r.changes.length + " change(s)"; $("#pbar").style.width = "10%";
+  $("#progress").scrollIntoView({behavior: "smooth"}); $("#go").disabled = true;
+  poll(r.id);
+});
 function show(id, j) {
   const r = j.result, o = r.output;
   const dg = $("#diag"); dg.innerHTML = "";
@@ -1373,6 +1461,7 @@ function show(id, j) {
   const url = f => "/jobs/" + id + "/" + encodeURIComponent(f);
   $("#player").src = url(r.files.mp3_preview || r.files.master_16bit_cd);
   fanShow(r.fan, url);
+  engShow(id, r);
   $("#checks").innerHTML = "";
   r.checks.forEach(c => { const li = document.createElement("li");
     li.innerHTML = '<span class="' + (c.ok ? "ok" : "warn") + '">' + (c.ok ? "✓" : "!") + "</span> ";

@@ -455,6 +455,12 @@ def deliver(pre: np.ndarray, premaster: np.ndarray, sr: int, preset: Preset, nam
         checks.append({"check": "Survives Spotify's encoder at full level (normalisation off)", "ok": ok,
                        "detail": detail})
     log["delivery_check"] = checks
+    try:  # engineer notes: a bonus, never a reason to lose a finished master
+        from .ai import notes as notes_mod
+
+        log["notes"] = notes_mod.make(out_dir, files, preset, final)
+    except Exception as e:
+        log["notes_error"] = str(e)
     log["processing_seconds"] = round(time.time() - t0, 1)
 
     (out_dir / f"{name}_report.json").write_text(json.dumps(log, indent=2, default=float))

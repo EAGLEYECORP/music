@@ -33,6 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-stems", action="store_true", help="don't export the processed vocal/instrumental stems")
     ap.add_argument("--no-previews", action="store_true",
                     help="skip the listen-like-a-fan previews (Spotify / Apple Music / YouTube / phone speaker)")
+    ap.add_argument("--ask", metavar="WORDS",
+                    help='tell the engineer in plain words (English or French), e.g. '
+                         '"more 808, vocal a bit less harsh" or "voix plus forte, trop de reverb"')
     ap.add_argument("-q", "--quiet", action="store_true")
     ap.add_argument("--version", action="version", version=f"studiomix {__version__}")
 
@@ -131,6 +134,20 @@ def parse_deliver(text: str | None) -> list[str]:
     return out
 
 
+def _ask(text: str | None, preset):
+    """Apply plain-words requests and say exactly what they changed."""
+    if not text:
+        return preset
+    from .ai.engineer import EXAMPLES, interpret
+
+    preset, said, unknown = interpret(text, preset)
+    for line in said:
+        print(f"  engineer: {line}")
+    for u in unknown:
+        print(f"  engineer: didn't understand \"{u}\" - try e.g.: {EXAMPLES}")
+    return preset
+
+
 def _print_summary(log: dict, out: str) -> None:
     o = log["output"]
     print(f"\ndone in {log['processing_seconds']}s -> {out}/")
@@ -143,6 +160,8 @@ def _print_summary(log: dict, out: str) -> None:
         print(f"  [{'PASS' if c['ok'] else 'WARN'}] {c['check']}: {c['detail']}")
     for v in log["files"].values():
         print(f"  {v}")
+    for n in log.get("notes", []):
+        print(f"  NOTE: {n['text']}\n        to fix it, add: --ask \"{n['ask']}\"")
     fan = log.get("previews")
     if fan:
         print("  listen like a fan (how each app plays it):")
@@ -175,6 +194,7 @@ def master_main(argv: list[str]) -> int:
                     help="extra verified versions: " + ", ".join(DELIVERY_PROFILES))
     ap.add_argument("--profile", metavar="NAME", help="master toward a learned reference profile")
     ap.add_argument("--no-previews", action="store_true", help="skip the listen-like-a-fan previews")
+    ap.add_argument("--ask", metavar="WORDS", help='plain-words changes, e.g. "louder, wider, 808 on phones"')
     ap.add_argument("--ai-remix", action="store_true",
                     help="AI: pull the vocal and the beat apart, then re-tune, re-mix and master "
                          "(needs onnxruntime; about real time on a 4-core computer)")
@@ -198,6 +218,7 @@ def master_main(argv: list[str]) -> int:
 
             prof = profiles.load(a.profile)
             preset = profiles.apply(prof, preset, keep_loudness=a.target_lufs is not None)
+        preset = _ask(a.ask, preset)
         if a.ai_remix:
             from .engine import ai_remix
 
@@ -344,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
 
             prof = profiles.load(args.profile)
             preset = profiles.apply(prof, preset, keep_loudness=args.target_lufs is not None)
+        preset = _ask(args.ask, preset)
     except (ValueError, KeyError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

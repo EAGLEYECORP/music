@@ -246,10 +246,28 @@ def build_stack(lead: np.ndarray, sr: int, capture: dict, p: Preset, active: np.
 
 # ------------------------------------------------------------------ instrumental
 
+def bass_harmonics(x: np.ndarray, sr: int, amount: float) -> np.ndarray:
+    """Overtones of the sub-bass (mono): a phone speaker plays nothing below ~300 Hz, so an 808
+    vanishes on it - but the ear rebuilds a low note from its overtones (the "missing
+    fundamental"). Saturating the sub creates them; only the 150 Hz - 1.5 kHz part is added."""
+    sub = filters.lowpass(np.mean(x, axis=0, keepdims=True), sr, 120.0, order=4)
+    peak = float(np.max(np.abs(sub))) + 1e-12
+    shaped = np.tanh(4.0 * sub / peak) + 0.6 * (np.abs(sub) / peak)   # odd + even harmonics
+    h = filters.lowpass(filters.highpass(shaped, sr, 160.0, order=4), sr, 1500.0, order=2)
+    rms_sub, rms_h = np.sqrt(np.mean(sub ** 2)) + 1e-12, np.sqrt(np.mean(h ** 2)) + 1e-12
+    return (h * (0.5 * amount * rms_sub / rms_h))[0]
+
+
 def instrumental_chain(inst: np.ndarray, vocal_dry: np.ndarray, sr: int, active: np.ndarray, p: Preset,
                        log: dict) -> np.ndarray:
     inst = effects.to_stereo(inst)
     inst = filters.highpass(inst, sr, p.inst_hpf_hz, order=4)
+    if p.inst_low_db:
+        inst = signal.sosfilt(filters.biquad_sos("lowshelf", 90.0, sr, 0.7071, p.inst_low_db), inst, axis=-1)
+        log["low_shelf_db"] = p.inst_low_db
+    if p.bass_harmonics > 0:
+        inst = inst + bass_harmonics(inst, sr, p.bass_harmonics)[None, :]
+        log["bass_harmonics"] = p.bass_harmonics
     if p.inst_carve_db > 0:
         # dynamic EQ: dip the vocal's presence range in the beat only while the vocal is singing
         band = filters.bandpass(inst, sr, 1500.0, 5000.0, order=2)
